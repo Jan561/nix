@@ -16,9 +16,39 @@ use libc::{
 };
 #[cfg(not(target_os = "redox"))]
 use std::io::{IoSlice, IoSliceMut};
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[cfg(feature = "uio")]
+use std::iter::{Chain, once, Once, FusedIterator};
+#[cfg(not(target_os = "redox"))]
+#[cfg(feature = "uio")]
+use std::mem::MaybeUninit;
 #[cfg(feature = "net")]
 use std::net;
 use std::os::unix::io::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(not(target_os = "redox"))]
+use std::ptr::addr_of_mut;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[cfg(feature = "uio")]
+use std::slice::{Iter, IterMut};
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[cfg(feature = "uio")]
+use std::vec::Drain;
 use std::{mem, ptr};
 
 #[deny(missing_docs)]
@@ -654,16 +684,17 @@ impl<'a, S> RecvMsg<'a, '_, S> {
     pub fn cmsgs(&self) -> CmsgIterator {
         CmsgIterator {
             cmsghdr: self.cmsghdr,
-            mhdr: &self.mhdr
+            mhdr: MaybeUninit::new(self.mhdr),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct CmsgIterator<'a> {
     /// Control message buffer to decode from. Must adhere to cmsg alignment.
     cmsghdr: Option<&'a cmsghdr>,
-    mhdr: &'a msghdr
+    // SAFETY: `msg_control` and `msg_controllen` must be initialized.
+    mhdr: MaybeUninit<msghdr>,
 }
 
 impl<'a> Iterator for CmsgIterator<'a> {
@@ -679,7 +710,7 @@ impl<'a> Iterator for CmsgIterator<'a> {
                 // Advance the internal pointer.  Safe if mhdr and cmsghdr point
                 // to valid data returned by recvmsg(2)
                 self.cmsghdr = unsafe {
-                    let p = CMSG_NXTHDR(self.mhdr as *const _, hdr as *const _);
+                    let p = CMSG_NXTHDR(self.mhdr.as_ptr(), hdr as *const _);
                     p.as_ref()
                 };
                 cm
@@ -1571,7 +1602,6 @@ pub fn sendmsg<S>(fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage],
     Errno::result(ret).map(|r| r as usize)
 }
 
-
 /// An extension of `sendmsg` that allows the caller to transmit multiple
 /// messages on a socket using a single system call. This has performance
 /// benefits for some applications.
@@ -1585,9 +1615,15 @@ pub fn sendmsg<S>(fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage],
 /// * `flags`:          Optional flags passed directly to the operating system.
 ///
 /// # Returns
+/// 
 /// `Vec` with numbers of sent bytes on each sent message.
+/// 
+/// # Panics
+/// 
+/// This function panics if the number of messages to send exceeds `u32::MAX`. This does not apply to FreeBSD targets.
 ///
 /// # References
+/// 
 /// [`sendmsg`](fn.sendmsg.html)
 #[cfg(any(
     target_os = "linux",
@@ -1644,6 +1680,12 @@ pub fn sendmmsg<'a, XS, AS, C, I, S>(
         count = i + 1;
     }
 
+    #[cfg(not(target_os = "freebsd"))]
+    let count = count.try_into().unwrap();
+
+    #[cfg(target_os = "freebsd")]
+    let count = count as _;
+
     // SAFETY: all pointers are guaranteed to be valid for the scope of this function. `count` does represent the
     // maximum number of messages that can be sent safely (i.e. `count` is the minimum of the sizes of `slices`,
     // `data.items` and `addrs`)
@@ -1651,7 +1693,7 @@ pub fn sendmmsg<'a, XS, AS, C, I, S>(
         libc::sendmmsg(
             fd,
             data.items.as_mut_ptr(),
-            count as _,
+            count,
             flags.bits() as _
         )
     })? as usize;
@@ -1753,6 +1795,10 @@ impl<S> MultiHeaders<S> {
 /// call to recvmmsg(). In the current implementation, however, the error code can be
 /// overwritten in the meantime by an unrelated network event on a socket, for example an
 /// incoming ICMP packet.
+/// 
+/// # Panics
+/// 
+/// This function panics if the number of messages to receive exceeds `u32::MAX`. This does not apply to FreeBSD targets.
 
 // On aarch64 linux using recvmmsg and trying to get hardware/kernel timestamps might not
 // always produce the desired results - see https://github.com/nix-rust/nix/pull/1744 for more
@@ -1792,13 +1838,19 @@ where
         .as_mut()
         .map_or_else(std::ptr::null_mut, |t| t as *mut _ as *mut libc::timespec);
 
+    #[cfg(not(target_os = "freebsd"))]
+    let count = count.try_into().unwrap();
+
+    #[cfg(target_os = "freebsd")]
+    let count = count as _;
+    
     // SAFETY: all pointers are guaranteed to be valid for the scope of this function. `count` does represent the
     // maximum number of messages that can be received safely (i.e. `count` is the minimum of the sizes of `slices` and `data.items`)
     let received = Errno::result(unsafe {
         libc::recvmmsg(
             fd,
             data.items.as_mut_ptr(),
-            count as _,
+            count,
             flags.bits() as _,
             timeout_ptr,
         )
@@ -1877,6 +1929,887 @@ impl<'a, S> RecvMsg<'_, 'a, S> {
             },
         }
     }
+}
+
+/// Control message buffer for sending messages.
+/// 
+/// # Safety
+/// 
+/// [`Self::raw_parts`] must return a pointer and length `len`, such that
+/// if `len > 0`, the pointer must be valid and point to a contiguous buffer with
+/// `len` bytes, which contains properly aligned control messages.
+/// 
+/// See the libc manual of [`cmsg`] for more information.
+/// 
+/// [`cmsg`]: https://www.man7.org/linux/man-pages/man3/cmsg.3.html
+pub unsafe trait CmsgBuf {
+    /// Returns a pointer and length to the buffer containing control messages.
+    /// 
+    /// If the buffer is empty, the pointer can be dangling or null.
+    fn raw_parts(&self) -> (*const u8, usize);
+}
+
+unsafe impl<'a, T> CmsgBuf for &'a T
+where
+    T: CmsgBuf,
+{
+    fn raw_parts(&self) -> (*const u8, usize) {
+        (*self).raw_parts()
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+pub type CmsgRemainder<'a, I> = Chain<Once<ControlMessage<'a>>, I>;
+
+/// Writes the given control messages into the given buffer.
+/// 
+/// Buffers are zero-initialized before writing. If the buffer is already zero-initialized,
+/// consider using [`write_cmsg_into_unchecked`] instead.
+/// 
+/// Returns the number of bytes written into the buffer. If the buffer was too small,
+/// the control messages that didn't fit in are returned additionally.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+pub fn write_cmsg_into<'a, I>(
+    buf: &mut [u8],
+    cmsg: I,
+) -> std::result::Result<usize, (usize, CmsgRemainder<'a, I::IntoIter>)>
+where
+    I: IntoIterator<Item = ControlMessage<'a>>,
+{
+    buf.iter_mut().for_each(|b| *b = 0);
+
+    // SAFETY: `buf` is zero-initialized.
+    unsafe {
+        write_cmsg_into_unchecked(buf, cmsg)
+    }
+}
+
+/// Writes the given control messages into the given buffer.
+/// 
+/// Returns the number of bytes written into the buffer. If the buffer was too small,
+/// the control messages that didn't fit in are returned additionally. 
+/// 
+/// # Safety
+/// 
+/// `buf` must be zero-initialized when calling this function.
+#[cfg(any(
+target_os = "linux",
+target_os = "android",
+target_os = "freebsd",
+target_os = "netbsd",
+))]
+pub unsafe fn write_cmsg_into_unchecked<'a, I>(
+    buf: &mut [u8],
+    cmsg: I,
+) -> std::result::Result<usize, (usize, CmsgRemainder<'a, I::IntoIter>)>
+where
+    I: IntoIterator<Item = ControlMessage<'a>>,
+{
+    let mut mhdr = cmsg_dummy_mhdr(buf.as_mut_ptr(), buf.len());
+
+    // SAFETY: call to extern function without sideeffects. We need to start from a mutable
+    // reference before casting it to a `*const` as we want to use the resulting pointer mutably.
+    let mut cmsg_ptr = unsafe { CMSG_FIRSTHDR(mhdr.as_mut_ptr().cast_const()) };
+
+    let mut written = 0;
+
+    let mut cmsg = cmsg.into_iter();
+
+    for c in cmsg.by_ref() {
+        if cmsg_ptr.is_null() || c.space() > buf.len() - written {
+            return Err((written, once(c).chain(cmsg)));
+        }
+
+        written += c.space();
+
+        // SAFETY: relies on `CMSG_FIRSTHDR` and `CMSG_NXTHDR` for safety.
+        // `CMSG_FIRSTHDR` and `CMSG_NXTHDR` don't access the other
+        // uninitialized fields of `mhdr`.
+        // 
+        // See https://man7.org/linux/man-pages/man3/cmsg.3.html.
+        unsafe {
+            c.encode_into(cmsg_ptr.cast());
+        }
+
+        // SAFETY: call to extern function without sideeffects. We need to start from a mutable
+        // reference before casting it to a `*const` as we want to use the resulting pointer mutably.
+        cmsg_ptr = unsafe { CMSG_NXTHDR(mhdr.as_mut_ptr().cast_const(), cmsg_ptr) };
+    }
+
+    Ok(written)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]    
+fn cmsg_dummy_mhdr(buf: *mut u8, len: usize) -> MaybeUninit<libc::msghdr> {
+    let mut mhdr = MaybeUninit::<libc::msghdr>::uninit();
+        
+    // SAFETY: using `ptr::write` to not drop the old uninitialized value and `addr_of_mut`
+    // to not create references of `libc::msghdr` along the way.
+    unsafe {
+        addr_of_mut!((*mhdr.as_mut_ptr()).msg_control).write(buf.cast());
+        addr_of_mut!((*mhdr.as_mut_ptr()).msg_controllen).write(len as _);
+    }
+
+    mhdr
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]    
+pub fn cmsg_space_iter<'a, I>(cmsg: I) -> usize
+where
+    I: IntoIterator<Item = ControlMessage<'a>>,
+{
+    cmsg.into_iter().map(|c| c.space()).sum()
+}
+
+/// Non-growable heap-allocated container for control messages.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[derive(Debug, Clone)]
+pub struct CmsgVec(Option<Box<[u8]>>);
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl CmsgVec {
+    /// Returns an empty [`CmsgVec`].
+    /// 
+    /// No allocations are performed. Use this if no control messages are needed.
+    pub const fn empty() -> Self {
+        Self(None)
+    }
+
+    /// Allocates a buffer that contains the given control messages.
+    /// 
+    /// The `size` parameter determines the size of the allocation in bytes.
+    /// [`cmsg_space_iter`] can be used to calculate the exact number of bytes required to
+    /// hold the control messages.
+    /// 
+    /// If `size` is too small, the control messages that didn't fit in are returned additionally.
+    /// 
+    /// Note: this function allocates two times if `size` isn't accurate and there is spare capacity left.
+    pub fn from_iter<'a, I>(
+        cmsg: I,
+        size: usize,
+    ) -> std::result::Result<Self, (Self, CmsgRemainder<'a, I::IntoIter>)>
+    where
+        I: IntoIterator<Item = ControlMessage<'a>>,
+    {
+        let mut cmsg_buf = vec![0; size];
+
+        match unsafe { write_cmsg_into_unchecked(&mut cmsg_buf, cmsg) } {
+            Ok(written) => {
+                cmsg_buf.truncate(written);
+
+                Ok(Self(Some(cmsg_buf.into_boxed_slice())))
+            }
+            Err((written, i)) => {
+                cmsg_buf.truncate(written);
+
+                Err((Self(Some(cmsg_buf.into_boxed_slice())), i))
+            }
+        }
+    }
+
+    /// Returns an iterator over the control messages in this buffer.
+    pub fn iter(&self) -> CmsgIterator<'_> {
+        let (ptr, len) = self.raw_parts();
+        let mhdr = cmsg_dummy_mhdr(ptr.cast_mut(), len);
+
+        CmsgIterator {
+            // SAFETY: `self.0` contains valid control messages, so casting to a
+            // reference is safe.
+            cmsghdr: unsafe { CMSG_FIRSTHDR(mhdr.as_ptr()).as_ref() },
+            mhdr,
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl Default for CmsgVec {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+// SAFETY: `self.0` contains valid control messages.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+unsafe impl CmsgBuf for CmsgVec {
+    fn raw_parts(&self) -> (*const u8, usize) {
+        self.0.as_ref().map(|s| (s.as_ptr(), s.len())).unwrap_or((ptr::null(), 0))
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+fn sendmmsg_headers_into<'a, J, S, I, C>(
+    buf: &mut [MaybeUninit<libc::mmsghdr>],
+    items: J,
+) -> std::result::Result<usize, J::IntoIter>
+where
+    J: IntoIterator<Item = (Option<&'a S>, I, C)>,
+    S: SockaddrLike + 'a,
+    I: AsRef<[IoSlice<'a>]>,
+    C: CmsgBuf,
+{
+    let mut i = 0;
+
+    let mut items = items.into_iter();
+
+    for (addr, iov, cmsg) in items.by_ref() {
+        if i >= buf.len() {
+            return Err(items);
+        }
+
+        let (addr_ptr, addr_len) = addr.map_or((ptr::null(), 0), |a| (a.as_ptr(), a.len()));
+        let (iov_ptr, iov_len) = (iov.as_ref().as_ptr(), iov.as_ref().len());
+        let (cmsg_ptr, cmsg_len) = cmsg.raw_parts();
+
+        let mut msg_hdr = MaybeUninit::<libc::msghdr>::zeroed();
+        let msg_hdr_ptr = msg_hdr.as_mut_ptr();
+
+        unsafe {
+            addr_of_mut!((*msg_hdr_ptr).msg_name).write(addr_ptr.cast_mut().cast());
+            addr_of_mut!((*msg_hdr_ptr).msg_namelen).write(addr_len as _);
+            addr_of_mut!((*msg_hdr_ptr).msg_iov).write(iov_ptr.cast_mut().cast());
+            addr_of_mut!((*msg_hdr_ptr).msg_iovlen).write(iov_len as _);
+            addr_of_mut!((*msg_hdr_ptr).msg_control).write(cmsg_ptr.cast_mut().cast());
+            addr_of_mut!((*msg_hdr_ptr).msg_controllen).write(cmsg_len as _);
+        }
+
+        let msg_hdr = unsafe { msg_hdr.assume_init() };
+
+        let mmsg_hdr = libc::mmsghdr {
+            msg_hdr,
+            msg_len: 0,
+        };
+
+        buf[i] = MaybeUninit::new(mmsg_hdr);
+
+        i += 1;
+    }
+
+    Ok(i)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[derive(Debug)]
+pub struct SendMmsg<S, I, C = CmsgVec> {
+    addrs: Vec<Option<S>>,
+    iovs: Vec<I>,
+    cmsgs: Vec<C>,
+    mmsghdrs: Vec<libc::mmsghdr>,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl<'a, S, I, C> SendMmsg<S, I, C>
+where
+    S: SockaddrLike,
+    I: AsRef<[IoSlice<'a>]>,
+    C: CmsgBuf,
+{
+    pub const fn new() -> Self {
+        Self {
+            addrs: Vec::new(),
+            iovs: Vec::new(),
+            cmsgs: Vec::new(),
+            mmsghdrs: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            addrs: Vec::with_capacity(cap),
+            iovs: Vec::with_capacity(cap),
+            cmsgs: Vec::with_capacity(cap),
+            mmsghdrs: Vec::with_capacity(cap),
+        }
+    }
+
+    pub fn push(&mut self, addr: Option<S>, iov: I, cmsg: C) {
+        self.addrs.push(addr);
+        self.iovs.push(iov);
+        self.cmsgs.push(cmsg);
+    }
+
+    pub fn sendmmsg(&mut self, fd: RawFd, flags: MsgFlags) -> crate::Result<SendMultiResults<'_, S, I, C>> {
+        self.prepare_mmhdrs();
+
+        #[cfg(not(target_os = "freebsd"))]
+        let mmsghdrs_len = self.mmsghdrs.len().try_into().unwrap();
+    
+        #[cfg(target_os = "freebsd")]
+        let mmsghdrs_len = self.mmsghdrs.len() as _;    
+
+        // SAFETY: `self.mmsghdrs` is filled with valid `mmsghdr` structs above.
+        let sent = Errno::result(unsafe {
+            libc::sendmmsg(
+                fd,
+                self.mmsghdrs.as_mut_ptr().cast(),
+                mmsghdrs_len,
+                flags.bits() as _,
+            )
+        })? as usize;
+
+        Ok(SendMultiResults {
+            addrs: self.addrs.drain(..sent),
+            iovs: self.iovs.drain(..sent),
+            cmsgs: self.cmsgs.drain(..sent),
+            mmsghdrs: self.mmsghdrs.iter(),
+        })
+    }
+
+    pub fn downgrade(self) -> SendMmsgAllocs {
+        SendMmsgAllocs::from_parts(self.mmsghdrs, self.addrs, self.iovs, self.cmsgs)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.addrs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.addrs.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.addrs.clear();
+        self.iovs.clear();
+        self.cmsgs.clear();
+    }
+
+    fn prepare_mmhdrs(&mut self) {
+        self.mmsghdrs.clear();
+        self.mmsghdrs.reserve(self.addrs.capacity());
+
+        let mmsghdrs_uninit_slice = unsafe {
+            std::slice::from_raw_parts_mut(self.mmsghdrs.as_mut_ptr().cast(), self.mmsghdrs.capacity())
+        };
+
+        let items = self.addrs
+            .iter()
+            .zip(self.iovs.iter())
+            .zip(self.cmsgs.iter())
+            .map(|((a, i), c)| (a.as_ref(), i.as_ref(), c));
+
+        let size = sendmmsg_headers_into(mmsghdrs_uninit_slice, items).unwrap_or_else(|_| unreachable!());
+
+        unsafe {
+            self.mmsghdrs.set_len(size);
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+unsafe impl<S, I, C> Send for SendMmsg<S, I, C>
+where
+    S: Send,
+    I: Send,
+    C: Send,
+{}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+unsafe impl<S, I, C> Sync for SendMmsg<S, I, C>
+where
+    S: Sync,
+    I: Sync,
+    C: Sync,
+{}
+
+/// Returned by [`SendMmsg::sendmmsg`]. This struct holds all allocations made by [`SendMmsg`]
+/// and allows the reuse of these allocations by calling [`SendMmsgAllocs::upgrade`].
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[derive(Debug)]
+pub struct SendMmsgAllocs {
+    mmsghdrs: Vec<libc::mmsghdr>,
+
+    // Tuples of ptr, allocation size and alignment, in this order.
+    // 
+    // SAFETY: ptr and allocation size need to be constructed from `Vec`s. Setting the capacity
+    // to 0 prevents the allocation from being deallocated. This is needed to prevent use-after-free when dropping
+    // `SendMmsgAllocs` after upgrading the buffers.
+    addrs: (std::ptr::NonNull<u8>, usize, usize),
+    iovs: (std::ptr::NonNull<u8>, usize, usize),
+    cmsgs: (std::ptr::NonNull<u8>, usize, usize),
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl SendMmsgAllocs {
+    fn from_parts<S, I, C>(mmsghdrs: Vec<libc::mmsghdr>, addrs: Vec<S>, iovs: Vec<I>, cmsgs: Vec<C>) -> Self {
+        let mut addrs = std::mem::ManuallyDrop::new(addrs);
+        let mut iovs = std::mem::ManuallyDrop::new(iovs);
+        let mut cmsgs = std::mem::ManuallyDrop::new(cmsgs);
+
+        Self {
+            mmsghdrs,
+            addrs: (
+                // SAFETY: allocation pointer is guaranteed to be non-null.
+                unsafe {
+                    std::ptr::NonNull::new_unchecked(addrs.as_mut_ptr().cast())
+                },
+                addrs.capacity() * std::mem::size_of::<S>(),
+                std::mem::align_of::<S>(),
+            ),
+            iovs: (
+                // SAFETY: allocation pointer is guaranteed to be non-null.
+                unsafe {
+                    std::ptr::NonNull::new_unchecked(iovs.as_mut_ptr().cast())
+                },
+                iovs.capacity() * std::mem::size_of::<I>(),
+                std::mem::align_of::<I>(),
+            ),
+            cmsgs: (
+                // SAFETY: allocation pointer is guaranteed to be non-null.
+                unsafe {
+                    std::ptr::NonNull::new_unchecked(cmsgs.as_mut_ptr().cast())
+                },
+                cmsgs.capacity() * std::mem::size_of::<C>(),
+                std::mem::align_of::<C>(),
+            ),
+        }
+    }
+
+    pub fn upgrade<S, I, C>(mut self) -> SendMmsg<S, I, C> {
+        let addrs = if std::mem::size_of::<S>() != 0 && std::mem::align_of::<S>() == self.addrs.2 && self.addrs.1 % std::mem::size_of::<S>() == 0 {
+            // SAFETY: all invariants of `upgrade_addrs` are upheld.
+            unsafe {
+                self.upgrade_addrs()
+            }
+        } else {
+            Vec::with_capacity(self.mmsghdrs.capacity())
+        };
+
+        let iovs = if std::mem::size_of::<I>() != 0 && std::mem::align_of::<I>() == self.iovs.2 && self.iovs.1 % std::mem::size_of::<I>() == 0 {
+            // SAFETY: all invariants of `upgrade_iovs` are upheld.
+            unsafe {
+                self.upgrade_iovs()
+            }
+        } else {
+            Vec::with_capacity(self.mmsghdrs.capacity())
+        };
+
+        let cmsgs = if std::mem::size_of::<C>() != 0 && std::mem::align_of::<C>() == self.cmsgs.2 && self.cmsgs.1 % std::mem::size_of::<C>() == 0 {
+            // SAFETY: all invariants of `upgrade_cmsgs` are upheld.
+            unsafe {
+                self.upgrade_cmsgs()
+            }
+        } else {
+            Vec::with_capacity(self.mmsghdrs.capacity())
+        };
+
+        SendMmsg {
+            addrs,
+            iovs,
+            cmsgs,
+            mmsghdrs: std::mem::take(&mut self.mmsghdrs),
+        }
+    }
+
+    pub fn upgrade_val<S, I, C>(self, _: &S, _: &I, _: &C) -> SendMmsg<S, I, C> {
+        self.upgrade()
+    }
+
+    /// # Safety
+    /// 
+    /// The following invaraints must hold for non-zero sized types `T` in `{S, I, C}` and their original type-counterparts `T'` used in [`SendMmsg`]:
+    /// 
+    /// - `T` must have (strictly) the same alignment as `T'`
+    /// - The size of `T'` must be a multiple of the size of `T`
+    pub unsafe fn upgrade_unchecked<S, I, C>(mut self) -> SendMmsg<S, I, C> {
+        let addrs = unsafe { self.upgrade_addrs() };
+        let iovs = unsafe { self.upgrade_iovs() };
+        let cmsgs = unsafe { self.upgrade_cmsgs() };
+
+        SendMmsg {
+            addrs,
+            iovs,
+            cmsgs,
+            mmsghdrs: std::mem::take(&mut self.mmsghdrs),
+        }
+    }
+
+    /// # Safety
+    /// 
+    /// See [`Self::upgrade_unchecked`].
+    pub unsafe fn upgrade_val_unchecked<S, I, C>(self, _: &S, _: &I, _: &C) -> SendMmsg<S, I, C> {
+        self.upgrade_unchecked()
+    }
+
+    /// # Safety
+    /// 
+    /// The following invaraints must hold for non-zero sized types `S`:
+    /// 
+    /// - `S` must have (strictly) the same alignment as the original type `S` used in [`SendMmsg`]
+    /// - The allocation size must be a multiple of the size of `S`
+    unsafe fn upgrade_addrs<S>(&mut self) -> Vec<S> {
+        debug_assert!(self.addrs.1 <= isize::MAX as usize);
+
+        debug_assert_ne!(std::mem::size_of::<S>(), 0);
+        debug_assert_eq!(std::mem::align_of::<S>(), self.addrs.2);
+        debug_assert!(std::mem::size_of::<S>() == 0 || self.addrs.1 % std::mem::size_of::<S>() == 0);
+
+        let cap = if std::mem::size_of::<S>() != 0 {
+            self.addrs.1 / std::mem::size_of::<S>()
+        } else {
+            self.dealloc_addrs();
+
+            0
+        };
+
+        // Prevents the deallocation of the buffer when dropping `self`.
+        self.addrs.1 = 0;
+
+        // SAFETY: the provided pointer and capacity originate from a `Vec` with enough capacity
+        // to hold `cap` elements of type `I`, while matching alignment. Passing a `len` of 0 is always safe.
+        unsafe {
+            Vec::from_raw_parts(self.addrs.0.as_ptr().cast(), 0, cap)
+        }
+    }
+
+    /// # Safety
+    /// 
+    /// The following invaraints must hold for non-zero sized types `I`:
+    /// 
+    /// - `I` must have (strictly) the same alignment as the original type `I` used in [`SendMmsg`]
+    /// - The allocation size must be a multiple of the size of `I`
+    unsafe fn upgrade_iovs<I>(&mut self) -> Vec<I> {
+        debug_assert!(self.iovs.1 <= isize::MAX as usize);
+
+        debug_assert_ne!(std::mem::size_of::<I>(), 0);
+        debug_assert_eq!(std::mem::align_of::<I>(), self.iovs.2);
+        debug_assert!(std::mem::size_of::<I>() == 0 || self.iovs.1 % std::mem::size_of::<I>() == 0);
+
+        let cap = if std::mem::size_of::<I>() != 0 {  
+            self.iovs.1 / std::mem::size_of::<I>()
+        } else {
+            self.dealloc_iovs();
+
+            0
+        };
+
+        // Prevents the deallocation of the buffer when dropping `self`.
+        self.iovs.1 = 0;
+
+        // SAFETY: the provided pointer and capacity originate from a `Vec` with enough capacity
+        // to hold `cap` elements of type `I`, while matching alignment. Passing a `len` of 0 is always safe.
+        unsafe {
+            Vec::from_raw_parts(self.iovs.0.as_ptr().cast(), 0, cap)
+        }
+    }
+
+    /// # Safety
+    /// 
+    /// The following invaraints must hold for non-zero sized types `C`:
+    /// 
+    /// - `C` must have (strictly) the same alignment as the original type `C` used in [`SendMmsg`]
+    /// - The allocation size must be a multiple of the size of `C`
+    unsafe fn upgrade_cmsgs<C>(&mut self) -> Vec<C> {
+        debug_assert!(self.cmsgs.1 <= isize::MAX as usize);
+
+        debug_assert_ne!(std::mem::size_of::<C>(), 0);
+        debug_assert_eq!(std::mem::align_of::<C>(), self.cmsgs.2);
+        debug_assert!(std::mem::size_of::<C>() == 0 || self.cmsgs.1 % std::mem::size_of::<C>() == 0);
+
+        let cap = if std::mem::size_of::<C>() != 0 {
+            self.cmsgs.1 / std::mem::size_of::<C>()
+        } else {
+            self.dealloc_cmsgs();
+
+            0
+        };
+
+        // Prevents the deallocation of the buffer when dropping `self`.
+        self.cmsgs.1 = 0;
+
+        // SAFETY: the provided pointer and capacity originate from a `Vec` with enough capacity
+        // to hold `cap` elements of type `I`, while matching alignment. Passing a `len` of 0 is always safe.
+        unsafe {
+            Vec::from_raw_parts(self.cmsgs.0.as_ptr().cast(), 0, cap)
+        }
+    }
+
+    fn dealloc_buffers(&mut self) {
+        self.dealloc_addrs();
+        self.dealloc_iovs();
+        self.dealloc_cmsgs();
+    }
+
+    fn dealloc_addrs(&mut self) {
+        unsafe {
+            if self.addrs.1 != 0 {
+                // SAFETY: the provided allocation size originates from a `Vec`, which satisfies the invariants
+                // of the first argument. The alignment is also guaranteed to be correct.
+                let layout = std::alloc::Layout::from_size_align_unchecked(self.addrs.1, self.addrs.2);
+                // Prevent double-free.
+                self.addrs.1 = 0;
+                // SAFETY: the provided layout is the same layout used to allocate the buffer. The pointer originates
+                // from the allocation and hasn't been deallocated yet.
+                std::alloc::dealloc(self.addrs.0.as_ptr(), layout);
+            }
+        }
+    }
+
+    fn dealloc_iovs(&mut self) {
+        unsafe {
+            if self.iovs.1 != 0 {
+                // SAFETY: the provided allocation size originates from a `Vec`, which satisfies the invariants
+                // of the first argument. The alignment is also guaranteed to be correct.
+                let layout = std::alloc::Layout::from_size_align_unchecked(self.iovs.1, self.iovs.2);
+                // Prevent double-free.
+                self.iovs.1 = 0;
+                // SAFETY: the provided layout is the same layout used to allocate the buffer. The pointer originates
+                // from the allocation and hasn't been deallocated yet.
+                std::alloc::dealloc(self.iovs.0.as_ptr(), layout);
+            }
+        }
+    }
+
+    fn dealloc_cmsgs(&mut self) {
+        unsafe {
+            if self.cmsgs.1 != 0 {
+                // SAFETY: the provided allocation size originates from a `Vec`, which satisfies the invariants
+                // of the first argument. The alignment is also guaranteed to be correct.
+                let layout = std::alloc::Layout::from_size_align_unchecked(self.cmsgs.1, self.cmsgs.2);
+                // Prevent double-free.
+                self.cmsgs.1 = 0;
+                // SAFETY: the provided layout is the same layout used to allocate the buffer. The pointer originates
+                // from the allocation and hasn't been deallocated yet.
+                std::alloc::dealloc(self.cmsgs.0.as_ptr(), layout);
+            }
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl Drop for SendMmsgAllocs {
+    fn drop(&mut self) {
+        self.dealloc_buffers();
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[derive(Debug, Clone)]
+pub struct SendMmsgIter<'a, S, I, C = CmsgVec> {
+    addrs: Iter<'a, Option<S>>,
+    iovs: Iter<'a, I>,
+    cmsgs: Iter<'a, C>,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl<'a, S, I, C> Iterator for SendMmsgIter<'a, S, I, C> {
+    type Item = (Option<&'a S>, &'a I, &'a C);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let addr = self.addrs.next()?;
+        let iov = self.iovs.next().unwrap();
+        let cmsg = self.cmsgs.next().unwrap();
+
+        Some((addr.as_ref(), iov, cmsg))
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[derive(Debug)]
+pub struct SendMmsgIterMut<'a, S, I, C = CmsgVec> {
+    addrs: IterMut<'a, Option<S>>,
+    iovs: IterMut<'a, I>,
+    cmsgs: IterMut<'a, C>,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl<'a, S, I, C> Iterator for SendMmsgIterMut<'a, S, I, C> {
+    type Item = (Option<&'a mut S>, &'a mut I, &'a mut C);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let addr = self.addrs.next()?;
+        let iov = self.iovs.next().unwrap();
+        let cmsg = self.cmsgs.next().unwrap();
+
+        Some((addr.as_mut(), iov, cmsg))
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[derive(Debug)]
+pub struct SendMultiResults<'a, S, I, C = CmsgVec> {
+    addrs: Drain<'a, Option<S>>,
+    iovs: Drain<'a, I>,
+    cmsgs: Drain<'a, C>,
+    mmsghdrs: Iter<'a, libc::mmsghdr>,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl<'a, S, I, C> Iterator for SendMultiResults<'a, S, I, C> {
+    type Item = SendResult<S, I, C>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let addr = self.addrs.next()?;
+        let iov = self.iovs.next().unwrap();
+        let cmsg = self.cmsgs.next().unwrap();
+
+        let hdr = self.mmsghdrs.next().unwrap();
+
+
+        Some(SendResult { addr, iov, cmsg, bytes: hdr.msg_len as usize })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.addrs.size_hint()
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl<'a, S, I, C> ExactSizeIterator for SendMultiResults<'a, S, I, C> {}
+
+// unsafe impl<'a, S, I, C> TrustedLen for SendMultiResults<'a, S, I, C> {}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl<'a, S, I, C> DoubleEndedIterator for SendMultiResults<'a, S, I, C> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let addr = self.addrs.next_back()?;
+        let iov = self.iovs.next_back().unwrap();
+        let cmsg = self.cmsgs.next_back().unwrap();
+
+        let hdr = self.mmsghdrs.next_back().unwrap();
+
+        Some(SendResult { addr, iov, cmsg, bytes: hdr.msg_len as usize })
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+impl<'a, S, I, C> FusedIterator for SendMultiResults<'a, S, I, C> {}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+))]
+#[derive(Debug, Clone)]
+pub struct SendResult<S, I, C = CmsgVec> {
+    pub addr: Option<S>,
+    pub iov: I,
+    pub cmsg: C,
+    pub bytes: usize,
 }
 
 #[derive(Debug)]
@@ -2066,13 +2999,17 @@ unsafe fn pack_mhdr_to_receive<S>(
     // initialize it.
     let mut mhdr = mem::MaybeUninit::<msghdr>::zeroed();
     let p = mhdr.as_mut_ptr();
-    (*p).msg_name = address as *mut c_void;
-    (*p).msg_namelen = S::size();
-    (*p).msg_iov = iov_buffer as *mut iovec;
-    (*p).msg_iovlen = iov_buffer_len as _;
-    (*p).msg_control = cmsg_buffer as *mut c_void;
-    (*p).msg_controllen = cmsg_capacity as _;
-    (*p).msg_flags = 0;
+
+    unsafe {
+        addr_of_mut!((*p).msg_name).write(address as *mut c_void);
+        addr_of_mut!((*p).msg_namelen).write(S::size());
+        addr_of_mut!((*p).msg_iov).write(iov_buffer as *mut iovec);
+        addr_of_mut!((*p).msg_iovlen).write(iov_buffer_len as _);
+        addr_of_mut!((*p).msg_control).write(cmsg_buffer as *mut c_void);
+        addr_of_mut!((*p).msg_controllen).write(cmsg_capacity as _);
+        addr_of_mut!((*p).msg_flags).write(0);
+    }
+
     mhdr.assume_init()
 }
 
@@ -2096,37 +3033,44 @@ fn pack_mhdr_to_send<'a, I, C, S>(
         ptr::null_mut()
     };
 
-    let mhdr = unsafe {
+    let mut mhdr = unsafe {
         // Musl's msghdr has private fields, so this is the only way to
         // initialize it.
         let mut mhdr = mem::MaybeUninit::<msghdr>::zeroed();
         let p = mhdr.as_mut_ptr();
-        (*p).msg_name = addr.map(S::as_ptr).unwrap_or(ptr::null()).cast_mut().cast();
-        (*p).msg_namelen = addr.map(S::len).unwrap_or(0);
+
+        addr_of_mut!((*p).msg_name).write(addr.map(S::as_ptr).unwrap_or(ptr::null()).cast_mut().cast());
+        addr_of_mut!((*p).msg_namelen).write(addr.map(S::len).unwrap_or(0));
         // transmute iov into a mutable pointer.  sendmsg doesn't really mutate
         // the buffer, but the standard says that it takes a mutable pointer
-        (*p).msg_iov = iov.as_ref().as_ptr().cast_mut().cast();
-        (*p).msg_iovlen = iov.as_ref().len() as _;
-        (*p).msg_control = cmsg_ptr;
-        (*p).msg_controllen = capacity as _;
-        (*p).msg_flags = 0;
-        mhdr.assume_init()
+        addr_of_mut!((*p).msg_iov).write(iov.as_ref().as_ptr().cast_mut().cast());
+        addr_of_mut!((*p).msg_iovlen).write(iov.as_ref().len() as _);
+        addr_of_mut!((*p).msg_control).write(cmsg_ptr);
+        addr_of_mut!((*p).msg_controllen).write(capacity as _);
+        addr_of_mut!((*p).msg_flags).write(0);
+
+        mhdr
     };
 
     // Encode each cmsg.  This must happen after initializing the header because
     // CMSG_NEXT_HDR and friends read the msg_control and msg_controllen fields.
     // CMSG_FIRSTHDR is always safe
-    let mut pmhdr: *mut cmsghdr = unsafe { CMSG_FIRSTHDR(&mhdr as *const msghdr) };
+    //
+    // SAFETY: we need to start from a mutable reference before casting it to a `*const`
+    // as we want to use the resulting pointer mutably.
+    let mut pmhdr: *mut cmsghdr = unsafe { CMSG_FIRSTHDR(mhdr.as_mut_ptr().cast_const()) };
     for cmsg in cmsgs.as_ref() {
         assert_ne!(pmhdr, ptr::null_mut());
         // Safe because we know that pmhdr is valid, and we initialized it with
         // sufficient space
         unsafe { cmsg.encode_into(pmhdr) };
-        // Safe because mhdr is valid
-        pmhdr = unsafe { CMSG_NXTHDR(&mhdr as *const msghdr, pmhdr) };
+
+        // SAFETY: we need to start from a mutable reference before casting it to a `*const`
+        // as we want to use the resulting pointer mutably.
+        pmhdr = unsafe { CMSG_NXTHDR(mhdr.as_mut_ptr().cast_const(), pmhdr) };
     }
 
-    mhdr
+    unsafe { mhdr.assume_init() }
 }
 
 /// Receive message in scatter-gather vectors from a socket, and
