@@ -1415,7 +1415,7 @@ mod test {
         use super::super::*;
 
         let (a, b) = socketpair(
-            AddressFamily::Unix,
+            AddressFamily::UNIX,
             SockType::Stream,
             None,
             SockFlag::empty(),
@@ -1432,7 +1432,7 @@ mod test {
         use super::super::*;
 
         let (a, _b) = socketpair(
-            AddressFamily::Unix,
+            AddressFamily::UNIX,
             SockType::Stream,
             None,
             SockFlag::empty(),
@@ -1447,7 +1447,7 @@ mod test {
         use super::super::*;
 
         let s = socket(
-            AddressFamily::Inet,
+            AddressFamily::INET,
             SockType::Datagram,
             SockFlag::empty(),
             None,
@@ -1463,7 +1463,7 @@ mod test {
         use super::super::*;
 
         let s = socket(
-            AddressFamily::Inet,
+            AddressFamily::INET,
             SockType::Stream,
             SockFlag::empty(),
             None,

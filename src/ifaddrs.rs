@@ -12,7 +12,7 @@ use std::mem;
 use std::option::Option;
 
 use crate::net::if_::*;
-use crate::sys::socket::{SockaddrLike, SockaddrStorage};
+use crate::sys::socket::{SockaddrLikePriv, SockaddrStorage};
 use crate::{Errno, Result};
 
 /// Describes a single address for an interface as returned by `getifaddrs`.
@@ -180,6 +180,7 @@ pub fn getifaddrs() -> Result<InterfaceAddressIterator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys::socket::{AddressFamily, SockaddrLike};
 
     // Only checks if `getifaddrs` can be invoked without panicking.
     #[test]
@@ -198,12 +199,10 @@ mod tests {
             } else {
                 continue;
             };
-            if sock.family() == Some(crate::sys::socket::AddressFamily::Inet) {
+            if sock.family() == AddressFamily::INET {
                 let _ = sock.as_sockaddr_in().unwrap();
                 return;
-            } else if sock.family()
-                == Some(crate::sys::socket::AddressFamily::Inet6)
-            {
+            } else if sock.family() == AddressFamily::INET6 {
                 let _ = sock.as_sockaddr_in6().unwrap();
                 return;
             }
