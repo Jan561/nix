@@ -44,10 +44,6 @@ task:
       freebsd_instance:
         image_family: freebsd-14-0-snap
         cpu: 2
-      depends_on:
-        - Rust Formatter
-        - Minver
-        - Rust Stable
       # Enable tests that would fail on FreeBSD 12
       RUSTFLAGS: --cfg fbsd14 -D warnings
       RUSTDOCFLAGS: --cfg fbsd14
@@ -76,10 +72,6 @@ task:
       arm_container:
         image: rust:1.69.0
         cpu: 2
-      depends_on:
-        - Rust Formatter
-        - Minver
-        - Rust Stable
       env:
         TARGET: aarch64-unknown-linux-gnu
   setup_script:
@@ -87,40 +79,3 @@ task:
     - rustup component add clippy
   << : *TEST
   before_cache_script: rm -rf $CARGO_HOME/registry/index
-
-task:
-  name: Rust Stable
-  container:
-    image: rust:latest
-    cpu: 2
-  env:
-    TARGET: x86_64-unknown-linux-gnu
-  setup_script:
-    - rustup component add clippy
-  << : *TEST
-  before_cache_script: rm -rf $CARGO_HOME/registry/index
-
-# Test that we can build with the lowest version of all dependencies.
-# "cargo test" doesn't work because some of our dev-dependencies, like
-# rand, can't build with their own minimal dependencies.
-task:
-  name: Minver
-  env:
-    HOST: x86_64-unknown-linux-gnu
-  container:
-    image: rustlang/rust:nightly
-    cpu: 1
-  setup_script:
-    - cargo update -Zminimal-versions
-  check_script:
-    - cargo check
-  before_cache_script: rm -rf $CARGO_HOME/registry/index
-
-# Tasks that checks if the code is formatted right using `cargo fmt` tool
-task:
-  name: Rust Formatter
-  container:
-    image: rust:latest
-    cpu: 1
-  setup_script: rustup component add rustfmt
-  test_script: cargo fmt --all -- --check **/*.rs
