@@ -13,7 +13,7 @@ use std::mem::{self, MaybeUninit};
 use std::option::Option;
 
 use crate::net::if_::*;
-use crate::sys::socket::{RawAddress, SockaddrStorage};
+use crate::sys::socket::{RawAddress, SockaddressStorage};
 use crate::{Errno, Result};
 
 /// Describes a single address for an interface as returned by `getifaddrs`.

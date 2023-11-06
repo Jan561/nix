@@ -3,7 +3,7 @@ use crate::*;
 use libc::c_char;
 use nix::sys::socket::{
     cmsg_space_iter, getsockname, AddressFamily, CmsgEmpty, CmsgVecRead,
-    CmsgVecWrite, NoAddress, RecvMsgHeader, UnixAddr,
+    CmsgVecWrite, NoAddress, RecvMsgHeader, UnixAddress,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -96,7 +96,7 @@ pub fn test_timestamping() {
 pub fn test_path_to_sock_addr() {
     let path = "/foo/bar";
     let actual = Path::new(path);
-    let addr = UnixAddr::new(actual).unwrap();
+    let addr = UnixAddress::new(actual).unwrap();
 
     let expect: &[c_char] =
         unsafe { slice::from_raw_parts(path.as_ptr().cast(), path.len()) };
@@ -115,7 +115,7 @@ fn calculate_hash<T: Hash>(t: &T) -> u64 {
 pub fn test_addr_equality_path() {
     let path = "/foo/bar";
     let actual = Path::new(path);
-    let addr1 = UnixAddr::new(actual).unwrap();
+    let addr1 = UnixAddress::new(actual).unwrap();
     let mut addr2 = addr1;
 
     unsafe { (*addr2.as_mut_ptr()).sun_path[10] = 127 };
@@ -128,7 +128,7 @@ pub fn test_addr_equality_path() {
 #[test]
 pub fn test_abstract_sun_path_too_long() {
     let name = String::from("nix\0abstract\0tesnix\0abstract\0tesnix\0abstract\0tesnix\0abstract\0tesnix\0abstract\0testttttnix\0abstract\0test\0make\0sure\0this\0is\0long\0enough");
-    let addr = UnixAddr::new_abstract(name.as_bytes());
+    let addr = UnixAddress::new_abstract(name.as_bytes());
     addr.expect_err("assertion failed");
 }
 
@@ -136,7 +136,7 @@ pub fn test_abstract_sun_path_too_long() {
 #[test]
 pub fn test_addr_equality_abstract() {
     let name = String::from("nix\0abstract\0test");
-    let addr1 = UnixAddr::new_abstract(name.as_bytes()).unwrap();
+    let addr1 = UnixAddress::new_abstract(name.as_bytes()).unwrap();
     let mut addr2 = addr1;
 
     assert_eq!(addr1, addr2);
@@ -152,12 +152,12 @@ pub fn test_addr_equality_abstract() {
 #[test]
 pub fn test_abstract_uds_addr() {
     let empty = String::new();
-    let addr = UnixAddr::new_abstract(empty.as_bytes()).unwrap();
+    let addr = UnixAddress::new_abstract(empty.as_bytes()).unwrap();
     let sun_path: [u8; 0] = [];
     assert_eq!(addr.as_abstract(), Some(&sun_path[..]));
 
     let name = String::from("nix\0abstract\0test");
-    let addr = UnixAddr::new_abstract(name.as_bytes()).unwrap();
+    let addr = UnixAddress::new_abstract(name.as_bytes()).unwrap();
     let sun_path = [
         110u8, 105, 120, 0, 97, 98, 115, 116, 114, 97, 99, 116, 0, 116, 101,
         115, 116,
@@ -175,7 +175,7 @@ pub fn test_abstract_uds_addr() {
 pub fn test_unnamed_uds_addr() {
     use crate::nix::sys::socket::SockaddrLike;
 
-    let addr = UnixAddr::new_unnamed();
+    let addr = UnixAddress::new_unnamed();
 
     assert!(addr.is_unnamed());
     assert_eq!(addr.len(), 2);
@@ -199,7 +199,7 @@ pub fn test_getsockname() {
         None,
     )
     .expect("socket failed");
-    let sockaddr = UnixAddr::new(&sockname).unwrap();
+    let sockaddr = UnixAddress::new(&sockname).unwrap();
     bind(sock.as_raw_fd(), &sockaddr).expect("bind failed");
     assert_eq!(
         Some(sockaddr),
@@ -239,7 +239,7 @@ pub fn test_recvmsg_sockaddr_un() {
         None,
     )
     .expect("socket failed");
-    let sockaddr = UnixAddr::new(&sockname).unwrap();
+    let sockaddr = UnixAddress::new(&sockname).unwrap();
     bind(sock.as_raw_fd(), &sockaddr).expect("bind failed");
 
     // Send a message
@@ -257,7 +257,7 @@ pub fn test_recvmsg_sockaddr_un() {
     // Receive the message
     let mut recv_buffer = [0u8; 32];
     let mut iov = [std::io::IoSliceMut::new(&mut recv_buffer)];
-    let mut header = RecvMsgHeader::<Option<UnixAddr>>::new();
+    let mut header = RecvMsgHeader::<Option<UnixAddress>>::new();
 
     let received = socket::recvmsg(
         sock.as_raw_fd(),
@@ -297,10 +297,10 @@ mod recvfrom {
         ssock: RawFd,
         f_send: Fs,
         mut f_recv: Fr,
-    ) -> Option<SockaddrStorage>
+    ) -> Option<SockaddressStorage>
     where
         Fs: Fn(RawFd, &[u8], MsgFlags) -> Result<usize> + Send + 'static,
-        Fr: FnMut(usize, SockaddrStorage),
+        Fr: FnMut(usize, SockaddressStorage),
     {
         let mut buf: [u8; 13] = [0u8; 13];
         let mut l = 0;
@@ -1612,7 +1612,9 @@ fn test_impl_scm_credentials_and_rights(space: usize) {
 // Test creating and using named unix domain sockets
 #[test]
 pub fn test_named_unixdomain() {
-    use nix::sys::socket::{accept, bind, connect, listen, socket, UnixAddr};
+    use nix::sys::socket::{
+        accept, bind, connect, listen, socket, UnixAddress,
+    };
     use nix::sys::socket::{SockFlag, SockType};
     use nix::unistd::{read, write};
     use std::thread;
@@ -1626,7 +1628,7 @@ pub fn test_named_unixdomain() {
         None,
     )
     .expect("socket failed");
-    let sockaddr = UnixAddr::new(&sockname).unwrap();
+    let sockaddr = UnixAddress::new(&sockname).unwrap();
     bind(s1.as_raw_fd(), &sockaddr).expect("bind failed");
     listen(&s1, 10).expect("listen failed");
 
@@ -1666,7 +1668,7 @@ pub fn test_unnamed_unixdomain() {
     )
     .expect("socketpair failed");
 
-    let addr_1: Option<UnixAddr> =
+    let addr_1: Option<UnixAddress> =
         getsockname(fd_1.as_raw_fd()).expect("getsockname failed");
     assert!(addr_1.unwrap().is_unnamed());
 }
@@ -1688,9 +1690,9 @@ pub fn test_unnamed_unixdomain_autobind() {
 
     // unix(7): "If a bind(2) call specifies addrlen as `sizeof(sa_family_t)`, or [...], then the
     // socket is autobound to an abstract address"
-    bind(fd.as_raw_fd(), &UnixAddr::new_unnamed()).expect("bind failed");
+    bind(fd.as_raw_fd(), &UnixAddress::new_unnamed()).expect("bind failed");
 
-    let addr: Option<UnixAddr> =
+    let addr: Option<UnixAddress> =
         getsockname(fd.as_raw_fd()).expect("getsockname failed");
     let addr = addr.as_ref().unwrap().as_abstract().unwrap();
 
@@ -2738,7 +2740,7 @@ mod linux_errqueue {
 
         const MESSAGE_CONTENTS: &str = "ABCDEF";
         let std_sa = std::net::SocketAddr::from_str(sa).unwrap();
-        let sock_addr = SockaddrStorage::from(std_sa);
+        let sock_addr = SockaddressStorage::from(std_sa);
         let sock = socket(af, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)
             .unwrap();
         setsockopt(&sock, opt, &true).unwrap();
@@ -2763,7 +2765,7 @@ mod linux_errqueue {
         };
         let mut cmsg = CmsgVecRead::with_capacity(cmsg_space);
 
-        let mut header = RecvMsgHeader::<SockaddrStorage>::new();
+        let mut header = RecvMsgHeader::<SockaddressStorage>::new();
 
         let msg = recvmsg(
             sock.as_raw_fd(),
