@@ -1,27 +1,30 @@
+#[cfg(not(any(
+    target_os = "solaris",
+    target_os = "redox",
+)))]
+#[cfg(feature = "net")]
+pub use self::datalink::LinkAddress;
 #[cfg(any(
-    target_os = "android",
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "ios",
-    target_os = "linux",
     target_os = "macos",
     target_os = "illumos",
     target_os = "netbsd",
-    target_os = "openbsd",
     target_os = "haiku",
-    target_os = "fuchsia",
     target_os = "aix",
+    target_os = "openbsd"
 ))]
 #[cfg(feature = "net")]
 pub use self::datalink::LinkAddr;
 #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
-pub use self::vsock::VsockAddr;
+pub use self::vsock::VsockAddress;
 use super::sa_family_t;
 use crate::errno::Errno;
 #[cfg(any(target_os = "android", target_os = "linux"))]
-use crate::sys::socket::addr::alg::AlgAddr;
+use crate::sys::socket::addr::alg::AlgAddress;
 #[cfg(any(target_os = "android", target_os = "linux"))]
-use crate::sys::socket::addr::netlink::NetlinkAddr;
+use crate::sys::socket::addr::netlink::NetlinkAddress;
 #[cfg(all(
     feature = "ioctl",
     any(target_os = "ios", target_os = "macos")
@@ -31,14 +34,12 @@ use crate::{NixPath, Result};
 use cfg_if::cfg_if;
 use memoffset::offset_of;
 use std::borrow::{Borrow, BorrowMut};
-use std::convert::TryInto;
 use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::ptr::{addr_of_mut, addr_of, NonNull};
+use std::ptr::{addr_of_mut, addr_of};
 use std::{fmt, mem, net, ptr, slice};
 
 /// Convert a std::net::Ipv4Addr into the libc form.
@@ -856,50 +857,6 @@ pub(super) mod private {
     pub trait SockaddrLikePriv {}
 }
 
-#[doc(hidden)]
-pub trait AddrToOwned {
-    type Owned: 'static;
-
-    fn to_owned_addr(&self) -> Self::Owned;
-}
-
-macro_rules! addr_to_owned_option {
-    ($($ty:ty),*) => {
-        $(
-            impl<'a> AddrToOwned for Option<&'a $ty> {
-                type Owned = Option<<$ty as ToOwned>::Owned>;
-
-                fn to_owned_addr(&self) -> Self::Owned {
-                    self.as_deref().map(ToOwned::to_owned)
-                }
-            }
-        )*
-    }
-}
-
-impl AddrToOwned for () {
-    type Owned = ();
-
-    fn to_owned_addr(&self) -> Self::Owned {}
-}
-
-impl<T> AddrToOwned for *const T
-where
-    T: Copy + 'static,
-{
-    type Owned = MaybeUninit<T>;
-
-    fn to_owned_addr(&self) -> Self::Owned {
-        let mut res = MaybeUninit::uninit();
-
-        unsafe {
-            ptr::copy_nonoverlapping(*self, res.as_mut_ptr(), 1);
-        }
-
-        res
-    }
-}
-
 /// Checked conversion from a sockaddr pointer.
 ///
 /// # Safety
@@ -920,11 +877,8 @@ pub unsafe trait SockaddrFromRaw {
     /// The libc storage type for this socket address.
     type Storage;
 
-    /// The owned type of this socket address.
-    type Owned: 'static;
-
     /// The output type of [`Self::from_raw`].
-    type Out<'a>: AddrToOwned<Owned = Self::Owned>;
+    type Out;
 
     /// Unsafe constructor from a variable length source.
     ///
@@ -938,12 +892,15 @@ pub unsafe trait SockaddrFromRaw {
     /// - `addr` must be valid `Self::Storage`.
     /// - `addr` has been initialized with `Self::init_storage`.
     ///
-    /// Additionally, if `addr` is valid for `Self::Storage`, then `len` must not exceed the
+    /// Additionally, if `addr` is valid for `Self::Storage` and `len` doesn't exceed
+    /// the size of `[Self::Storage]`, then `len` must not exceed the
     /// length of valid data in `addr`.
-    unsafe fn from_raw<'a>(
+    ///
+    /// `addr` must be valid for the lifetime `'a`.
+    unsafe fn from_raw(
         addr: *const Self::Storage,
-        len: libc::socklen_t,
-    ) -> Self::Out<'a>;
+        len: usize,
+    ) -> Self::Out;
 
     /// Initialize the storage for this socket address, such that after calling this function,
     /// the memory representation of the argument is either valid or *provably* invalid for `Self`.
@@ -981,10 +938,10 @@ pub unsafe trait SockaddrLike: private::SockaddrLikePriv {
     /// # use std::os::unix::io::AsRawFd;
     /// let fd = socket(AddressFamily::INET, SockType::Stream,
     ///     SockFlag::empty(), None).unwrap();
-    /// let ss: SockaddrStorage = getsockname(fd.as_raw_fd()).unwrap();
+    /// let ss: Address = getsockname::<Address>(fd.as_raw_fd()).unwrap();
     /// match ss.family() {
-    ///     AddressFamily::INET => println!("{}", ss.to_sockaddr_in().unwrap()),
-    ///     AddressFamily::INET6 => println!("{}", ss.to_sockaddr_in6().unwrap()),
+    ///     AddressFamily::INET => println!("{}", ss.to_ipv4().unwrap()),
+    ///     AddressFamily::INET6 => println!("{}", ss.to_ipv6().unwrap()),
     ///     _ => println!("Unexpected address family")
     /// }
     /// ```
@@ -1021,12 +978,12 @@ pub unsafe trait SockaddrLike: private::SockaddrLikePriv {
             ///
             /// [known exception]: https://github.com/nix-rust/nix/issues/1709#issuecomment-1199304470
             /// [here]: https://github.com/freebsd/freebsd-src/blob/63bf943d4af17799cef21e2bb78dd28003ce1ce5/sys/net/if_dl.h#L66
-            fn len(&self) -> libc::socklen_t {
+            fn len(&self) -> usize {
                 // SAFETY: all references of implementors need to be castable to
                 // `&libc::sockaddr`, as required by safety invariants of this trait.
                 unsafe {
-                    (*(self as *const Self as *const libc::sockaddr)).sa_len
-                }.into()
+                    (*(self as *const Self as *const libc::sockaddr)).sa_len as _
+                }
             }
         } else {
             /// Return the length of valid data in the sockaddr structure.
@@ -1046,23 +1003,15 @@ pub unsafe trait SockaddrLike: private::SockaddrLikePriv {
             ///
             /// [known exception]: https://github.com/nix-rust/nix/issues/1709#issuecomment-1199304470
             /// [here]: https://github.com/freebsd/freebsd-src/blob/63bf943d4af17799cef21e2bb78dd28003ce1ce5/sys/net/if_dl.h#L66
-            fn len(&self) -> libc::socklen_t;
+            fn len(&self) -> usize;
         }
-    }
-
-    /// Return the available space in the structure
-    fn size() -> libc::socklen_t
-    where
-        Self: Sized,
-    {
-        mem::size_of::<Self>() as libc::socklen_t
     }
 }
 
 macro_rules! sockaddr_len_static {
     () => {
-        fn len(&self) -> libc::socklen_t {
-            mem::size_of::<Self>() as libc::socklen_t
+        fn len(&self) -> usize {
+            mem::size_of::<Self>()
         }
     };
 }
@@ -1079,13 +1028,12 @@ impl private::SockaddrLikePriv for NoAddress {}
 
 unsafe impl SockaddrFromRaw for () {
     type Storage = NoAddress;
-    type Owned = ();
-    type Out<'a> = ();
+    type Out = ();
 
-    unsafe fn from_raw<'a>(
+    unsafe fn from_raw(
         _: *const Self::Storage,
-        _: libc::socklen_t,
-    ) -> Self::Out<'a> {
+        _: usize,
+    ) -> Self::Out {
         // Returns `()`
     }
 
@@ -1099,18 +1047,44 @@ unsafe impl SockaddrLike for NoAddress {
     sockaddr_len_static!();
 }
 
-/// Non-owning dyn-sized wrapper around `sockaddr_un`.
-#[derive(Debug, PartialEq, Eq, ptr_meta::Pointee)]
+/// Non-owning dyn-sized wrapper for `sockaddr_un`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(not(doc), repr(transparent))]
 pub struct UnixAddr {
-    // We want `*const Self` to be a fat pointer,
-    // so we can add `sun_len` as metadata.
-    _dst: [u8],
+    slice: [u8],
 }
 
+#[allow(clippy::len_without_is_empty)]
 impl UnixAddr {
+    const fn from_raw_parts(data: *const libc::sockaddr_un, len: usize) -> *const Self {
+        let data_ptr = data.cast::<u8>();
+        let slice_ptr = ptr::slice_from_raw_parts(data_ptr, len);
+
+        slice_ptr as *const Self
+    }
+
+    const fn from_ref(data: &libc::sockaddr_un, len: usize) -> &Self {
+        unsafe {
+            &*Self::from_raw_parts(data, len)
+        }
+    }
+
+    fn from_raw_parts_mut(data: *mut libc::sockaddr_un, len: usize) -> *mut Self {
+        let data_ptr = data.cast::<u8>();
+        let slice_ptr = ptr::slice_from_raw_parts_mut(data_ptr, len);
+
+        slice_ptr as *mut Self
+    }
+
+    fn from_mut(data: &mut libc::sockaddr_un, len: usize) -> &mut Self {
+        unsafe {
+            &mut *Self::from_raw_parts_mut(data, len)
+        }
+    }
+
     /// Returns the total length of the address.
     pub fn len(&self) -> usize {
-        ptr_meta::metadata(self)
+        self.slice.len()
     }
 
     fn kind(&self) -> UnixAddrKind<'_> {
@@ -1153,22 +1127,13 @@ impl UnixAddr {
         self.len() - offset_of!(libc::sockaddr_un, sun_path)
     }
 
-    /// Returns a pointer to the raw `sockaddr_un` struct
-    pub fn as_ptr(&self) -> *const libc::sockaddr_un {
-        self as *const Self as *const _
-    }
+    /// Converts to an owned [`UnixAddress`] if the address fits into it.
+    pub fn to_owned(&self) -> Option<UnixAddress> {
+        if self.len() > mem::size_of::<libc::sockaddr_un>() {
+            return None;
+        }
 
-    /// Returns a mutable pointer to the raw `sockaddr_un` struct
-    pub fn as_mut_ptr(&mut self) -> *mut libc::sockaddr_un {
-        self as *mut Self as *mut _
-    }
-}
-
-impl ToOwned for UnixAddr {
-    type Owned = UnixAddress;
-
-    fn to_owned(&self) -> Self::Owned {
-        UnixAddress {
+        Some(UnixAddress {
             sun: unsafe { *self.as_ptr() },
             #[cfg(any(
                 target_os = "android",
@@ -1178,83 +1143,39 @@ impl ToOwned for UnixAddr {
                 target_os = "redox",
             ))]
             sun_len: self.len() as _,
-        }
+        })
+    }
+
+    /// Returns a pointer to the raw `sockaddr_un` struct
+    pub fn as_ptr(&self) -> *const libc::sockaddr_un {
+        self.slice.as_ptr().cast()
+    }
+
+    /// Returns a mutable pointer to the raw `sockaddr_un` struct
+    pub fn as_mut_ptr(&mut self) -> *mut libc::sockaddr_un {
+        self.slice.as_mut_ptr().cast()
     }
 }
 
-addr_to_owned_option!(UnixAddr);
-
-unsafe impl SockaddrFromRaw for UnixAddr {
-    type Storage = libc::sockaddr_un;
-    type Owned = Option<UnixAddress>;
-    type Out<'a> = Option<&'a UnixAddr>;
-
-    unsafe fn from_raw<'a>(
-        addr: *const Self::Storage,
-        len: libc::socklen_t,
-    ) -> Self::Out<'a> {
-        if (len as usize) < offset_of!(libc::sockaddr_un, sun_path)
-            || len > mem::size_of::<libc::sockaddr_un>() as libc::socklen_t
-        {
-            return None;
-        }
-
-        // SAFETY: `sa_family` has been initialized by `Self::init_storage` or by the syscall.
-        unsafe {
-            if addr_of!((*addr).sun_family).read() as libc::c_int != libc::AF_UNIX {
-                return None;
-            }
-        }
-
-        unsafe {
-            Some(&*ptr_meta::from_raw_parts(addr.cast(), len as _))
-        }
+impl PartialEq<UnixAddress> for UnixAddr {
+    fn eq(&self, other: &UnixAddress) -> bool {
+        *self == **other
     }
 }
 
-unsafe impl SockaddrFromRaw for *const UnixAddr {
-    type Storage = libc::sockaddr_un;
-    type Owned = MaybeUninit<UnixAddress>;
-    type Out<'a> = *const UnixAddr;
-
-    unsafe fn from_raw<'a>(
-        addr: *const Self::Storage,
-        len: libc::socklen_t,
-    ) -> Self::Out<'a> {
-        ptr_meta::from_raw_parts(addr.cast(), len as _)
-    }
-
-    fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
-        // Nothing to do
-    }
-}
-
-impl AddrToOwned for *const UnixAddr {
-    type Owned = MaybeUninit<UnixAddress>;
-
-    fn to_owned_addr(&self) -> Self::Owned {
-        let mut res = MaybeUninit::<UnixAddress>::uninit();
-        let res_ptr = res.as_mut_ptr();
-
-        unsafe {
-            ptr::copy_nonoverlapping(self.cast(), addr_of_mut!((*res_ptr).sun), 1);
-
-            #[cfg(any(
-                target_os = "android",
-                target_os = "fuchsia",
-                target_os = "illumos",
-                target_os = "linux",
-                target_os = "redox",
-            ))]
-            addr_of_mut!((*res_ptr).sun_len).write((**self).len() as _);
+impl fmt::Display for UnixAddr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.kind() {
+            UnixAddrKind::Pathname(path) => path.display().fmt(f),
+            UnixAddrKind::Unnamed => f.pad("<unbound UNIX socket>"),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            UnixAddrKind::Abstract(name) => fmt_abstract(name, f),
         }
-
-        res
     }
 }
 
 /// A wrapper around `sockaddr_un`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq)]
 #[repr(C)]
 pub struct UnixAddress {
     // INVARIANT: sun & sun_len are valid as defined by docs for from_raw_parts
@@ -1269,7 +1190,7 @@ pub struct UnixAddress {
         target_os = "linux",
         target_os = "redox",
     ))]
-    sun_len: u8,
+    sun_len: usize,
 }
 
 // linux man page unix(7) says there are 3 kinds of unix socket:
@@ -1338,10 +1259,8 @@ impl UnixAddress {
                 return Err(Errno::ENAMETOOLONG);
             }
 
-            let sun_len = (bytes.len()
-                + offset_of!(libc::sockaddr_un, sun_path))
-            .try_into()
-            .unwrap();
+            // We add 1 for the trailing NUL
+            let sun_len = bytes.len() + offset_of!(libc::sockaddr_un, sun_path) + 1;
 
             #[cfg(any(
                 target_os = "dragonfly",
@@ -1352,7 +1271,7 @@ impl UnixAddress {
                 target_os = "openbsd"
             ))]
             {
-                ret.sun_len = sun_len;
+                ret.sun_len = sun_len as _;
             }
             ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -1383,10 +1302,9 @@ impl UnixAddress {
             if path.len() >= ret.sun_path.len() {
                 return Err(Errno::ENAMETOOLONG);
             }
-            let sun_len =
-                (path.len() + 1 + offset_of!(libc::sockaddr_un, sun_path))
-                    .try_into()
-                    .unwrap();
+
+            // We add 1 for the leading NUL
+            let sun_len = path.len() + 1 + offset_of!(libc::sockaddr_un, sun_path);
 
             // Abstract addresses are represented by sun_path[0] ==
             // b'\0', so copy starting one byte in.
@@ -1409,8 +1327,7 @@ impl UnixAddress {
             ..unsafe { mem::zeroed() }
         };
 
-        let sun_len: u8 =
-            offset_of!(libc::sockaddr_un, sun_path).try_into().unwrap();
+        let sun_len = offset_of!(libc::sockaddr_un, sun_path);
 
         unsafe { UnixAddress::from_raw_parts(ret, sun_len) }
     }
@@ -1428,7 +1345,7 @@ impl UnixAddress {
     ///   fs path, not necessarily nul-terminated.
     pub(crate) unsafe fn from_raw_parts(
         sun: libc::sockaddr_un,
-        sun_len: u8,
+        sun_len: usize,
     ) -> UnixAddress {
         cfg_if! {
             if #[cfg(any(target_os = "android",
@@ -1440,7 +1357,7 @@ impl UnixAddress {
             {
                 UnixAddress { sun, sun_len }
             } else {
-                assert_eq!(sun_len, sun.sun_len);
+                assert_eq!(sun_len, sun.sun_len as usize);
                 UnixAddress {sun}
             }
         }
@@ -1451,63 +1368,137 @@ impl std::ops::Deref for UnixAddress {
     type Target = UnixAddr;
 
     fn deref(&self) -> &Self::Target {
-        cfg_if! {
-            if #[cfg(any(
-                target_os = "android",
-                target_os = "fuchsia",
-                target_os = "illumos",
-                target_os = "linux",
-                target_os = "redox",
-            ))] {
-                let len = self.sun_len;
-            } else {
-                let len = self.sun.sun_len;
-            }
-        }
-
-        let ptr = ptr_meta::from_raw_parts(
-            &self.sun as *const _ as *const _,
-            len as _
-        );
-
-        unsafe { &*ptr }
+        UnixAddr::from_ref(&self.sun, self.len())
     }
 }
 
 impl std::ops::DerefMut for UnixAddress {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        cfg_if! {
-            if #[cfg(any(
-                target_os = "android",
-                target_os = "fuchsia",
-                target_os = "illumos",
-                target_os = "linux",
-                target_os = "redox",
-            ))] {
-                let len = self.sun_len;
-            } else {
-                let len = self.sun.sun_len;
-            }
-        }
+        let len = self.len();
 
-        let ptr = ptr_meta::from_raw_parts_mut(
-            &mut self.sun as *mut _ as *mut _,
-            len as _,
-        );
+        UnixAddr::from_mut(&mut self.sun, len)
+    }
+}
 
-        unsafe { &mut *ptr }
+impl AsRef<UnixAddr> for UnixAddress {
+    fn as_ref(&self) -> &UnixAddr {
+        self
+    }
+}
+
+impl AsMut<UnixAddr> for UnixAddress {
+    fn as_mut(&mut self) -> &mut UnixAddr {
+        self
     }
 }
 
 impl Borrow<UnixAddr> for UnixAddress {
     fn borrow(&self) -> &UnixAddr {
-        &**self
+        self
     }
 }
 
 impl BorrowMut<UnixAddr> for UnixAddress {
     fn borrow_mut(&mut self) -> &mut UnixAddr {
-        &mut **self
+        self
+    }
+}
+
+impl PartialEq<UnixAddress> for UnixAddress {
+    fn eq(&self, other: &UnixAddress) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<UnixAddr> for UnixAddress {
+    fn eq(&self, other: &UnixAddr) -> bool {
+        **self == *other
+    }
+}
+
+impl Hash for UnixAddress {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
+impl std::fmt::Display for UnixAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+unsafe impl SockaddrFromRaw for UnixAddress {
+    type Storage = libc::sockaddr_un;
+    type Out = Option<UnixAddress>;
+
+    unsafe fn from_raw(
+        addr: *const Self::Storage,
+        len: usize,
+    ) -> Self::Out {
+        if len < offset_of!(libc::sockaddr_un, sun_path)
+            || len > mem::size_of::<libc::sockaddr_un>()
+        {
+            return None;
+        }
+
+        // SAFETY: `sa_family` has been initialized by `Self::init_storage` or by the syscall.
+        unsafe {
+            if addr_of!((*addr).sun_family).read() as libc::c_int != libc::AF_UNIX {
+                return None;
+            }
+        }
+
+        cfg_if! {
+            if #[cfg(debug_assertions)] {
+                {
+                    let addr = unsafe { UnixAddr::from_ref(&*addr, len as _) };
+                    const PATH_OFFSET: usize = offset_of!(libc::sockaddr_un, sun_path);
+                    let path_len = len - PATH_OFFSET;
+
+                    // If not abstract and unnamed, the path must be NUL-terminated
+                    if path_len > 0 && addr.slice[PATH_OFFSET] != 0 {
+                        assert_eq!(addr.slice[len - 1], 0);
+                    }
+                }
+            }
+        }
+
+        unsafe {
+            Some(UnixAddress::from_raw_parts(*addr, len as _))
+        }
+    }
+}
+
+unsafe impl SockaddrFromRaw for MaybeUninit<UnixAddress> {
+    type Storage = libc::sockaddr_un;
+    type Out = MaybeUninit<UnixAddress>;
+
+    unsafe fn from_raw(
+        addr: *const Self::Storage,
+        _len: usize,
+    ) -> Self::Out {
+        let mut buf = MaybeUninit::<UnixAddress>::uninit();
+        let buf_ptr = buf.as_mut_ptr();
+
+        unsafe {
+            ptr::copy_nonoverlapping(addr, addr_of_mut!((*buf_ptr).sun), 1);
+
+            #[cfg(any(
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "illumos",
+                target_os = "linux",
+                target_os = "redox",
+            ))]
+            addr_of_mut!((*buf_ptr).sun_len).write(_len as _);
+        }
+
+        buf
+    }
+
+    fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
+        // Nothing to do
     }
 }
 
@@ -1521,15 +1512,26 @@ unsafe impl SockaddrLike for UnixAddress {
         target_os = "linux",
         target_os = "redox",
     ))]
-    fn len(&self) -> libc::socklen_t {
-        self.sun_len.into()
+    fn len(&self) -> usize {
+        debug_assert!(self.sun_len <= mem::size_of::<libc::sockaddr_un>());
+
+        self.sun_len as _
     }
 
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "redox",
+    )))]
+    fn len(&self) -> usize {
+        let len = self.sun.sun_len as usize;
 
-    fn size() -> libc::socklen_t {
-        mem::size_of::<libc::sockaddr_un>() as libc::socklen_t
+        debug_assert!(len <= mem::size_of::<libc::sockaddr_un>());
+
+        len
     }
-
 }
 
 impl AsRef<libc::sockaddr_un> for UnixAddress {
@@ -1550,39 +1552,14 @@ fn fmt_abstract(abs: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
     Ok(())
 }
 
-impl fmt::Display for UnixAddress {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.kind() {
-            UnixAddrKind::Pathname(path) => path.display().fmt(f),
-            UnixAddrKind::Unnamed => f.pad("<unbound UNIX socket>"),
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            UnixAddrKind::Abstract(name) => fmt_abstract(name, f),
-        }
-    }
-}
-
-impl PartialEq for UnixAddress {
-    fn eq(&self, other: &UnixAddress) -> bool {
-        self.kind() == other.kind()
-    }
-}
-
-impl Eq for UnixAddress {}
-
-impl Hash for UnixAddress {
-    fn hash<H: Hasher>(&self, s: &mut H) {
-        self.kind().hash(s)
-    }
-}
-
 /// An IPv4 socket address
 #[cfg(feature = "net")]
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SockaddrIn(libc::sockaddr_in);
+pub struct Ipv4Address(libc::sockaddr_in);
 
 #[cfg(feature = "net")]
-impl SockaddrIn {
+impl Ipv4Address {
     /// Returns the IP address associated with this socket address, in native
     /// endian.
     pub const fn ip(&self) -> libc::in_addr_t {
@@ -1602,7 +1579,7 @@ impl SockaddrIn {
                 target_os = "haiku",
                 target_os = "openbsd"
             ))]
-            sin_len: Self::size() as u8,
+            sin_len: mem::size_of::<libc::sockaddr_in>() as u8,
             sin_family: libc::AF_INET as sa_family_t,
             sin_port: u16::to_be(port),
             sin_addr: libc::in_addr {
@@ -1620,21 +1597,21 @@ impl SockaddrIn {
 }
 
 #[cfg(feature = "net")]
-impl private::SockaddrLikePriv for SockaddrIn {}
+impl private::SockaddrLikePriv for Ipv4Address {}
 
 #[cfg(feature = "net")]
-addr_to_owned_option!(SockaddrIn);
-
-#[cfg(feature = "net")]
-unsafe impl SockaddrFromRaw for SockaddrIn {
+unsafe impl SockaddrFromRaw for Ipv4Address {
     type Storage = libc::sockaddr_in;
-    type Owned = Option<SockaddrIn>;
-    type Out<'a> = Option<&'a SockaddrIn>;
+    type Out = Option<Ipv4Address>;
 
-    unsafe fn from_raw<'a>(
+    unsafe fn from_raw(
         addr: *const Self::Storage,
-        _: libc::socklen_t,
-    ) -> Self::Out<'a> {
+        len: usize,
+    ) -> Self::Out {
+        if len > mem::size_of::<libc::sockaddr_in>() {
+            return None;
+        }
+
         // SAFETY: `sa_family` has been initialized by `Self::init_storage` or by the syscall.
         unsafe {
             if addr_of!((*addr).sin_family).read() as libc::c_int != libc::AF_INET {
@@ -1643,7 +1620,7 @@ unsafe impl SockaddrFromRaw for SockaddrIn {
         }
 
         unsafe {
-            Some(&*(addr.cast()))
+            Some(*addr.cast())
         }
     }
 
@@ -1655,16 +1632,15 @@ unsafe impl SockaddrFromRaw for SockaddrIn {
 }
 
 #[cfg(feature = "net")]
-unsafe impl SockaddrFromRaw for *const SockaddrIn {
+unsafe impl SockaddrFromRaw for MaybeUninit<Ipv4Address> {
     type Storage = libc::sockaddr_in;
-    type Owned = MaybeUninit<SockaddrIn>;
-    type Out<'a> = *const SockaddrIn;
+    type Out = MaybeUninit<Ipv4Address>;
 
-    unsafe fn from_raw<'a>(
+    unsafe fn from_raw(
         addr: *const Self::Storage,
-        _: libc::socklen_t,
-    ) -> Self::Out<'a> {
-        addr.cast()
+        _: usize,
+    ) -> Self::Out {
+        unsafe { *addr.cast() }
     }
 
     fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
@@ -1673,19 +1649,19 @@ unsafe impl SockaddrFromRaw for *const SockaddrIn {
 }
 
 #[cfg(feature = "net")]
-unsafe impl SockaddrLike for SockaddrIn {
+unsafe impl SockaddrLike for Ipv4Address {
     sockaddr_len_static!();
 }
 
 #[cfg(feature = "net")]
-impl AsRef<libc::sockaddr_in> for SockaddrIn {
+impl AsRef<libc::sockaddr_in> for Ipv4Address {
     fn as_ref(&self) -> &libc::sockaddr_in {
         &self.0
     }
 }
 
 #[cfg(feature = "net")]
-impl fmt::Display for SockaddrIn {
+impl fmt::Display for Ipv4Address {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let ne = u32::from_be(self.0.sin_addr.s_addr);
         let port = u16::from_be(self.0.sin_port);
@@ -1702,7 +1678,7 @@ impl fmt::Display for SockaddrIn {
 }
 
 #[cfg(feature = "net")]
-impl From<net::SocketAddrV4> for SockaddrIn {
+impl From<net::SocketAddrV4> for Ipv4Address {
     fn from(addr: net::SocketAddrV4) -> Self {
         Self(libc::sockaddr_in {
             #[cfg(any(
@@ -1725,8 +1701,8 @@ impl From<net::SocketAddrV4> for SockaddrIn {
 }
 
 #[cfg(feature = "net")]
-impl From<SockaddrIn> for net::SocketAddrV4 {
-    fn from(addr: SockaddrIn) -> Self {
+impl From<Ipv4Address> for net::SocketAddrV4 {
+    fn from(addr: Ipv4Address) -> Self {
         net::SocketAddrV4::new(
             net::Ipv4Addr::from(addr.0.sin_addr.s_addr.to_ne_bytes()),
             u16::from_be(addr.0.sin_port),
@@ -1735,11 +1711,11 @@ impl From<SockaddrIn> for net::SocketAddrV4 {
 }
 
 #[cfg(feature = "net")]
-impl std::str::FromStr for SockaddrIn {
+impl std::str::FromStr for Ipv4Address {
     type Err = net::AddrParseError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        net::SocketAddrV4::from_str(s).map(SockaddrIn::from)
+        net::SocketAddrV4::from_str(s).map(Ipv4Address::from)
     }
 }
 
@@ -1747,10 +1723,10 @@ impl std::str::FromStr for SockaddrIn {
 #[cfg(feature = "net")]
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SockaddrIn6(libc::sockaddr_in6);
+pub struct Ipv6Address(libc::sockaddr_in6);
 
 #[cfg(feature = "net")]
-impl SockaddrIn6 {
+impl Ipv6Address {
     /// Returns the flow information associated with this address.
     pub const fn flowinfo(&self) -> u32 {
         self.0.sin6_flowinfo
@@ -1774,18 +1750,18 @@ impl SockaddrIn6 {
 }
 
 #[cfg(feature = "net")]
-addr_to_owned_option!(SockaddrIn6);
-
-#[cfg(feature = "net")]
-unsafe impl SockaddrFromRaw for SockaddrIn6 {
+unsafe impl SockaddrFromRaw for Ipv6Address {
     type Storage = libc::sockaddr_in6;
-    type Owned = Option<SockaddrIn6>;
-    type Out<'a> = Option<&'a SockaddrIn6>;
+    type Out = Option<Ipv6Address>;
 
-    unsafe fn from_raw<'a>(
+    unsafe fn from_raw(
         addr: *const Self::Storage,
-        _: libc::socklen_t,
-    ) -> Self::Out<'a> {
+        len: usize,
+    ) -> Self::Out {
+        if len > mem::size_of::<libc::sockaddr_in6>() {
+            return None;
+        }
+
         // SAFETY: `sa_family` has been initialized by `Self::init_storage` or by the syscall.
         unsafe {
             if addr_of!((*addr).sin6_family).read() as libc::c_int != libc::AF_INET6 {
@@ -1794,7 +1770,7 @@ unsafe impl SockaddrFromRaw for SockaddrIn6 {
         }
 
         unsafe {
-            Some(&*(addr.cast()))
+            Some(*addr.cast())
         }
     }
 
@@ -1806,16 +1782,15 @@ unsafe impl SockaddrFromRaw for SockaddrIn6 {
 }
 
 #[cfg(feature = "net")]
-unsafe impl SockaddrFromRaw for *const SockaddrIn6 {
+unsafe impl SockaddrFromRaw for MaybeUninit<Ipv6Address> {
     type Storage = libc::sockaddr_in6;
-    type Owned = MaybeUninit<SockaddrIn6>;
-    type Out<'a> = *const SockaddrIn6;
+    type Out = MaybeUninit<Ipv6Address>;
 
-    unsafe fn from_raw<'a>(
+    unsafe fn from_raw(
         addr: *const Self::Storage,
-        _: libc::socklen_t,
-    ) -> Self::Out<'a> {
-        addr.cast()
+        _: usize,
+    ) -> Self::Out {
+        unsafe { *addr.cast() }
     }
 
     fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
@@ -1824,22 +1799,22 @@ unsafe impl SockaddrFromRaw for *const SockaddrIn6 {
 }
 
 #[cfg(feature = "net")]
-impl private::SockaddrLikePriv for SockaddrIn6 {}
+impl private::SockaddrLikePriv for Ipv6Address {}
 
 #[cfg(feature = "net")]
-unsafe impl SockaddrLike for SockaddrIn6 {
+unsafe impl SockaddrLike for Ipv6Address {
     sockaddr_len_static!();
 }
 
 #[cfg(feature = "net")]
-impl AsRef<libc::sockaddr_in6> for SockaddrIn6 {
+impl AsRef<libc::sockaddr_in6> for Ipv6Address {
     fn as_ref(&self) -> &libc::sockaddr_in6 {
         &self.0
     }
 }
 
 #[cfg(feature = "net")]
-impl fmt::Display for SockaddrIn6 {
+impl fmt::Display for Ipv6Address {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // These things are really hard to display properly.  Easier to let std
         // do it.
@@ -1854,7 +1829,7 @@ impl fmt::Display for SockaddrIn6 {
 }
 
 #[cfg(feature = "net")]
-impl From<net::SocketAddrV6> for SockaddrIn6 {
+impl From<net::SocketAddrV6> for Ipv6Address {
     fn from(addr: net::SocketAddrV6) -> Self {
         #[allow(clippy::needless_update)] // It isn't needless on Illumos
         Self(libc::sockaddr_in6 {
@@ -1880,8 +1855,8 @@ impl From<net::SocketAddrV6> for SockaddrIn6 {
 }
 
 #[cfg(feature = "net")]
-impl From<SockaddrIn6> for net::SocketAddrV6 {
-    fn from(addr: SockaddrIn6) -> Self {
+impl From<Ipv6Address> for net::SocketAddrV6 {
+    fn from(addr: Ipv6Address) -> Self {
         net::SocketAddrV6::new(
             net::Ipv6Addr::from(addr.0.sin6_addr.s6_addr),
             u16::from_be(addr.0.sin6_port),
@@ -1892,11 +1867,11 @@ impl From<SockaddrIn6> for net::SocketAddrV6 {
 }
 
 #[cfg(feature = "net")]
-impl std::str::FromStr for SockaddrIn6 {
+impl std::str::FromStr for Ipv6Address {
     type Err = net::AddrParseError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        net::SocketAddrV6::from_str(s).map(SockaddrIn6::from)
+        net::SocketAddrV6::from_str(s).map(Ipv6Address::from)
     }
 }
 
@@ -1904,122 +1879,81 @@ macro_rules! sockaddr_storage_conv {
     ($fname:ident, $nixty:ty, $cty:ident, $af:ident, $doc:tt) => {
         #[doc = $doc]
         pub fn $fname(&self) -> Option<&$nixty> {
-            let addr = &self.storage as *const _ as *const libc::$cty;
-            let len = self.len();
+            if self.family() != AddressFamily::$af {
+                return None;
+            }
+
+            let addr = self.as_ptr().cast();
 
             unsafe {
-                <$nixty>::from_raw(addr, len as _)
+                Some(&*addr)
             }
         }
     };
 }
 
 /// TBD
-#[derive(Debug, PartialEq, Eq, ptr_meta::Pointee)]
-pub struct SockaddrStorage {
-    _dst: [u8],
-}
-
-impl SockaddrStorage {
-    pub fn len(&self) -> usize {
-        ptr_meta::metadata(self)
-    }
-
-    pub fn as_ptr(&self) -> *const libc::sockaddr_storage {
-        self as *const Self as *const _
-    }
-
-    pub fn as_ptr_mut(&mut self) -> *mut libc::sockaddr_storage {
-        self as *mut Self as *mut _
-    }
-}
-
-impl ToOwned for SockaddrStorage {
-    type Owned = SockaddressStorage;
-
-    fn to_owned(&self) -> Self::Owned {
-        SockaddressStorage {
-            storage: unsafe { *self.as_ptr() },
-            #[cfg(any(
-                target_os = "android",
-                target_os = "fuchsia",
-                target_os = "illumos",
-                target_os = "linux",
-                target_os = "redox",
-            ))]
-            len: self.len() as _,
-        }
-    }
-}
-
-/// A container for any sockaddr type
-///
-/// Just like C's `sockaddr_storage`, this type is large enough to hold any type
-/// of sockaddr.  It can be used as an argument with functions like
-/// [`bind`](super::bind) and [`getsockname`](super::getsockname).  Though it is
-/// a union, it can be safely accessed through the `as_*` methods.
-///
-/// # Example
-/// ```
-/// # use nix::sys::socket::*;
-/// # use std::str::FromStr;
-/// # use std::os::unix::io::AsRawFd;
-/// let localhost = SockaddrIn::from_str("127.0.0.1:8081").unwrap();
-/// let fd = socket(AddressFamily::INET, SockType::Stream, SockFlag::empty(),
-///     None).unwrap();
-/// bind(fd.as_raw_fd(), &localhost).expect("bind");
-/// let ss: SockaddrStorage = getsockname(fd.as_raw_fd()).expect("getsockname");
-/// assert_eq!(localhost, ss.to_sockaddr_in().unwrap());
-/// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct SockaddressStorage {
-    storage: libc::sockaddr_storage,
-    #[cfg(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "linux",
-        target_os = "redox",
-    ))]
-    len: libc::socklen_t,
+#[derive(Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(not(doc), repr(transparent))]
+pub struct Addr {
+    slice: [u8],
 }
 
 #[allow(clippy::len_without_is_empty)]
-impl SockaddressStorage {
-    /// Returns the address family associated with this socket address.
-    pub const fn family(&self) -> AddressFamily {
-        AddressFamily(self.storage.ss_family as _)
+impl Addr {
+    const fn from_raw_parts(data: *const libc::sockaddr_storage, len: usize) -> *const Self {
+        let data_ptr = data.cast::<u8>();
+        let slice_ptr = ptr::slice_from_raw_parts(data_ptr, len);
+
+        slice_ptr as *const Self
     }
 
-    /// Returns the length of this socket address.
-    pub const fn len(&self) -> usize {
-        cfg_if! {
-            if #[cfg(any(
-                target_os = "android",
-                target_os = "fuchsia",
-                target_os = "illumos",
-                target_os = "linux",
-                target_os = "redox",
-            ))] {
-                self.len as usize
-            } else {
-                self.storage.ss_len as usize
-            }
+    const fn from_ref(data: &libc::sockaddr_storage, len: usize) -> &Self {
+        unsafe {
+            &*Self::from_raw_parts(data, len)
         }
     }
 
+    fn from_raw_parts_mut(data: *mut libc::sockaddr_storage, len: usize) -> *mut Self {
+        let data_ptr = data.cast::<u8>();
+        let slice_ptr = ptr::slice_from_raw_parts_mut(data_ptr, len);
+
+        slice_ptr as *mut Self
+    }
+
+    fn from_mut(data: &mut libc::sockaddr_storage, len: usize) -> &mut Self {
+        unsafe {
+            &mut *Self::from_raw_parts_mut(data, len)
+        }
+    }
+
+    const fn inner(&self) -> &libc::sockaddr_storage {
+        unsafe {
+            &*self.as_ptr()
+        }
+    }
+
+    /// Returns the length of this socket address.
+    pub fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    /// Returns the address family associated with this socket address.
+    pub const fn family(&self) -> AddressFamily {
+        AddressFamily(self.inner().ss_family as _)
+    }
+
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    sockaddr_storage_conv!(to_alg, AlgAddr, sockaddr_alg, ALG, "Converts to [`AlgAddr`], if the address family matches.");
+    sockaddr_storage_conv!(to_alg, AlgAddress, sockaddr_alg, ALG, "Converts to [`AlgAddress`], if the address family matches.");
 
     #[cfg(feature = "net")]
-    sockaddr_storage_conv!(to_sockaddr_in, SockaddrIn, sockaddr_in, INET, "Converts to [`SockaddrIn`], if the address family matches.");
+    sockaddr_storage_conv!(to_ipv4, Ipv4Address, sockaddr_in, INET, "Converts to [`Ipv4Address`], if the address family matches.");
 
     #[cfg(feature = "net")]
-    sockaddr_storage_conv!(to_sockaddr_in6, SockaddrIn6, sockaddr_in6, INET6, "Converts to [`SockaddrIn6`], if the address family matches.");
+    sockaddr_storage_conv!(to_ipv6, Ipv6Address, sockaddr_in6, INET6, "Converts to [`Ipv6Address`], if the address family matches.");
 
     #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
-    sockaddr_storage_conv!(to_vsock, VsockAddr, sockaddr_vm, VSOCK, "Converts to [`VsockAddr`], if the address family matches.");
+    sockaddr_storage_conv!(to_vsock, VsockAddress, sockaddr_vm, VSOCK, "Converts to [`VsockAddress`], if the address family matches.");
 
     #[cfg(all(
         feature = "net",
@@ -2035,7 +1969,16 @@ impl SockaddressStorage {
             target_os = "openbsd",
         ),
     ))]
-    sockaddr_storage_conv!(to_link, LinkAddr, sockaddr_dl, LINK, "Converts to [`LinkAddr`], if the address family matches.");
+    /// Converts to [`LinkAddr`], if the address family matches.
+    pub fn to_link(&self) -> Option<&LinkAddr> {
+        if self.family() != AddressFamily::LINK {
+            return None;
+        }
+
+        unsafe {
+            Some(LinkAddr::from_ref(&*self.as_ptr().cast(), self.len() as _))
+        }
+    }
 
     #[cfg(all(
         feature = "net",
@@ -2045,10 +1988,10 @@ impl SockaddressStorage {
             target_os = "linux",
         ),
     ))]
-    sockaddr_storage_conv!(to_link, LinkAddr, sockaddr_ll, PACKET, "Converts to [`LinkAddr`], if the address family matches.");
+    sockaddr_storage_conv!(to_link, LinkAddress, sockaddr_ll, PACKET, "Converts to [`LinkAddress`], if the address family matches.");
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    sockaddr_storage_conv!(to_netlink, NetlinkAddr, sockaddr_nl, NETLINK, "Converts to [`NetlinkAddr`], if the address family matches.");
+    sockaddr_storage_conv!(to_netlink, NetlinkAddress, sockaddr_nl, NETLINK, "Converts to [`NetlinkAddress`], if the address family matches.");
 
     #[cfg(all(
         feature = "ioctl",
@@ -2056,22 +1999,171 @@ impl SockaddressStorage {
     ))]
     sockaddr_storage_conv!(to_sys_control, SysControlAddr, sockaddr_ctl, SYSTEM, "Converts to [`SysControlAddr`], if the address family matches.");
 
-    sockaddr_storage_conv!(to_unix, UnixAddr, sockaddr_un, UNIX, "Converts to [`UnixAddr`], if the address family matches.");
+    /// Converts to [`UnixAddr`], if the address family matches.
+    pub fn to_unix(&self) -> Option<&UnixAddr> {
+        if self.family() != AddressFamily::UNIX {
+            return None;
+        }
+
+        unsafe {
+            Some(UnixAddr::from_ref(&*self.as_ptr().cast(), self.len() as _))
+        }
+    }
+
+    /// Returns the inner pointer.
+    pub const fn as_ptr(&self) -> *const libc::sockaddr_storage {
+        self.slice.as_ptr().cast()
+    }
+
+    /// Returns the inner mutable pointer.
+    pub fn as_ptr_mut(&mut self) -> *mut libc::sockaddr_storage {
+        self.slice.as_mut_ptr().cast()
+    }
 }
 
-impl AsRef<libc::sockaddr_storage> for SockaddressStorage {
+impl ToOwned for Addr {
+    type Owned = Address;
+
+    fn to_owned(&self) -> Self::Owned {
+        debug_assert!(self.len() <= mem::size_of::<libc::sockaddr_storage>());
+
+        let mut storage = MaybeUninit::<libc::sockaddr_storage>::zeroed();
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.as_ptr().cast::<u8>(),
+                storage.as_mut_ptr().cast(),
+                self.len(),
+            );
+        }
+
+        Address {
+            storage: unsafe { storage.assume_init() },
+            #[cfg(any(
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "illumos",
+                target_os = "linux",
+                target_os = "redox",
+            ))]
+            len: self.len() as _,
+        }
+    }
+}
+
+impl PartialEq<Address> for Addr {
+    fn eq(&self, other: &Address) -> bool {
+        *self == **other
+    }
+}
+
+impl fmt::Display for Addr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.family() {
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            AddressFamily::ALG => self.to_alg().unwrap().fmt(f),
+            #[cfg(feature = "net")]
+            AddressFamily::INET => self.to_ipv4().unwrap().fmt(f),
+            #[cfg(feature = "net")]
+            AddressFamily::INET6 => self.to_ipv6().unwrap().fmt(f),
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "illumos",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            #[cfg(feature = "net")]
+            AddressFamily::LINK => self.to_link().unwrap().fmt(f),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            AddressFamily::NETLINK => self.to_netlink().unwrap().fmt(f),
+            #[cfg(any(
+                target_os = "android",
+                target_os = "linux",
+                target_os = "fuchsia"
+            ))]
+            #[cfg(feature = "net")]
+            AddressFamily::PACKET => self.to_link().unwrap().fmt(f),
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            #[cfg(feature = "ioctl")]
+            AddressFamily::SYSTEM => self.to_sys_control().unwrap().fmt(f),
+            AddressFamily::UNIX => self.to_unix().unwrap().fmt(f),
+            #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+            AddressFamily::VSOCK => self.to_vsock().unwrap().fmt(f),
+            AddressFamily::UNSPEC => "<Address family unspecified>".fmt(f),
+            _ => "<Address family unknown>".fmt(f),
+        }
+    }
+}
+
+/// General purpose socket address with arbitrary address family.
+///
+/// Just like C's `sockaddr_storage`, this type is large enough to hold any type
+/// of sockaddr.  It can be used as an argument with functions like
+/// [`bind`](super::bind) and [`getsockname`](super::getsockname).  Though it is
+/// a union, it can be safely accessed through the `as_*` methods.
+///
+/// # Example
+/// ```
+/// # use nix::sys::socket::*;
+/// # use std::str::FromStr;
+/// # use std::os::unix::io::AsRawFd;
+/// let localhost = Ipv4Address::from_str("127.0.0.1:8081").unwrap();
+/// let fd = socket(AddressFamily::INET, SockType::Stream, SockFlag::empty(),
+///     None).unwrap();
+/// bind(fd.as_raw_fd(), &localhost).expect("bind");
+/// let ss: Address = getsockname::<Address>(fd.as_raw_fd()).expect("getsockname");
+/// assert_eq!(&localhost, ss.to_ipv4().unwrap());
+/// ```
+#[derive(Clone, Copy, Debug, Eq)]
+#[repr(C)]
+pub struct Address {
+    storage: libc::sockaddr_storage,
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "redox",
+    ))]
+    len: usize,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl Address {
+    /// Returns the length of this socket address.
+    pub const fn len(&self) -> usize {
+        cfg_if! {
+            if #[cfg(any(
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "illumos",
+                target_os = "linux",
+                target_os = "redox",
+            ))] {
+                self.len
+            } else {
+                self.storage.ss_len as usize
+            }
+        }
+    }
+}
+
+impl AsRef<libc::sockaddr_storage> for Address {
     fn as_ref(&self) -> &libc::sockaddr_storage {
         &self.storage
     }
 }
 
 #[cfg(feature = "net")]
-impl From<net::SocketAddrV4> for SockaddressStorage {
+impl From<net::SocketAddrV4> for Address {
     fn from(s: net::SocketAddrV4) -> Self {
         unsafe {
             let mut ss = MaybeUninit::<libc::sockaddr_storage>::zeroed();
 
-            let sin = SockaddrIn::from(s);
+            let sin = Ipv4Address::from(s);
 
             ptr::copy_nonoverlapping(&sin.0, ss.as_mut_ptr().cast(), 1);
 
@@ -2091,12 +2183,12 @@ impl From<net::SocketAddrV4> for SockaddressStorage {
 }
 
 #[cfg(feature = "net")]
-impl From<net::SocketAddrV6> for SockaddressStorage {
+impl From<net::SocketAddrV6> for Address {
     fn from(s: net::SocketAddrV6) -> Self {
         unsafe {
             let mut ss = MaybeUninit::<libc::sockaddr_storage>::zeroed();
 
-            let sin = SockaddrIn6::from(s);
+            let sin = Ipv6Address::from(s);
 
             ptr::copy_nonoverlapping(&sin.0, ss.as_mut_ptr().cast(), 1);
 
@@ -2116,7 +2208,7 @@ impl From<net::SocketAddrV6> for SockaddressStorage {
 }
 
 #[cfg(feature = "net")]
-impl From<net::SocketAddr> for SockaddressStorage {
+impl From<net::SocketAddr> for Address {
     fn from(s: net::SocketAddr) -> Self {
         match s {
             net::SocketAddr::V4(sa4) => Self::from(sa4),
@@ -2125,44 +2217,91 @@ impl From<net::SocketAddr> for SockaddressStorage {
     }
 }
 
-impl Borrow<SockaddrStorage> for SockaddressStorage {
-    fn borrow(&self) -> &SockaddrStorage {
+impl std::ops::Deref for Address {
+    type Target = Addr;
+
+    fn deref(&self) -> &Self::Target {
+        Addr::from_ref(&self.storage, self.len())
+    }
+}
+
+impl std::ops::DerefMut for Address {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let len = self.len();
+
+        Addr::from_mut(&mut self.storage, len)
+    }
+}
+
+impl AsRef<Addr> for Address {
+    fn as_ref(&self) -> &Addr {
         self
     }
 }
 
-impl std::ops::Deref for SockaddressStorage {
-    type Target = SockaddrStorage;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe {
-            &*ptr_meta::from_raw_parts(
-                &self.storage as *const _ as *const _,
-                self.len(),
-            )
-        }
+impl AsMut<Addr> for Address {
+    fn as_mut(&mut self) -> &mut Addr {
+        self
     }
 }
 
-impl<'a> AddrToOwned for &'a SockaddrStorage {
-    type Owned = SockaddressStorage;
-
-    fn to_owned_addr(&self) -> Self::Owned {
-        (*self).to_owned()
+impl Borrow<Addr> for Address {
+    fn borrow(&self) -> &Addr {
+        self
     }
 }
 
-unsafe impl SockaddrFromRaw for SockaddrStorage {
+impl BorrowMut<Addr> for Address {
+    fn borrow_mut(&mut self) -> &mut Addr {
+        self
+    }
+}
+
+impl PartialEq<Address> for Address {
+    fn eq(&self, other: &Address) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Addr> for Address {
+    fn eq(&self, other: &Addr) -> bool {
+        **self == *other
+    }
+}
+
+impl Hash for Address {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+unsafe impl SockaddrFromRaw for Address {
     type Storage = libc::sockaddr_storage;
-    type Owned = SockaddressStorage;
-    type Out<'a> = &'a SockaddrStorage;
+    type Out = Address;
 
-    unsafe fn from_raw<'a>(
+    unsafe fn from_raw(
         addr: *const Self::Storage,
-        len: libc::socklen_t,
-    ) -> Self::Out<'a> {
-        unsafe {
-            &*ptr_meta::from_raw_parts(addr.cast(), len as _)
+        len: usize,
+    ) -> Self::Out {
+        // All addresses should fit into a `sockaddr_storage`.
+        debug_assert!(len <= mem::size_of::<libc::sockaddr_storage>());
+
+        Address {
+            storage: unsafe { *addr },
+            #[cfg(any(
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "illumos",
+                target_os = "linux",
+                target_os = "redox",
+            ))]
+            len,
         }
     }
 
@@ -2173,9 +2312,9 @@ unsafe impl SockaddrFromRaw for SockaddrStorage {
     }
 }
 
-impl private::SockaddrLikePriv for SockaddressStorage {}
+impl private::SockaddrLikePriv for Address {}
 
-unsafe impl SockaddrLike for SockaddressStorage {
+unsafe impl SockaddrLike for Address {
     #[cfg(any(
         target_os = "android",
         target_os = "fuchsia",
@@ -2183,7 +2322,7 @@ unsafe impl SockaddrLike for SockaddressStorage {
         target_os = "linux",
         target_os = "redox",
     ))]
-    fn len(&self) -> libc::socklen_t {
+    fn len(&self) -> usize {
         self.len
     }
 }
@@ -2202,18 +2341,18 @@ pub mod netlink {
     /// [netlink(7)](https://man7.org/linux/man-pages/man7/netlink.7.html)
     #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
     #[repr(transparent)]
-    pub struct NetlinkAddr(pub(in super::super) sockaddr_nl);
+    pub struct NetlinkAddress(pub(in super::super) sockaddr_nl);
 
-    impl NetlinkAddr {
+    impl NetlinkAddress {
         /// Construct a new socket address from its port ID and multicast groups
         /// mask.
-        pub fn new(pid: u32, groups: u32) -> NetlinkAddr {
+        pub fn new(pid: u32, groups: u32) -> NetlinkAddress {
             let mut addr: sockaddr_nl = unsafe { mem::zeroed() };
             addr.nl_family = libc::AF_NETLINK as sa_family_t;
             addr.nl_pid = pid;
             addr.nl_groups = groups;
 
-            NetlinkAddr(addr)
+            NetlinkAddress(addr)
         }
 
         /// Return the socket's port ID.
@@ -2227,17 +2366,18 @@ pub mod netlink {
         }
     }
 
-    addr_to_owned_option!(NetlinkAddr);
-
-    unsafe impl SockaddrFromRaw for NetlinkAddr {
+    unsafe impl SockaddrFromRaw for NetlinkAddress {
         type Storage = libc::sockaddr_nl;
-        type Owned = Option<NetlinkAddr>;
-        type Out<'a> = Option<&'a NetlinkAddr>;
+        type Out = Option<NetlinkAddress>;
 
-        unsafe fn from_raw<'a>(
+        unsafe fn from_raw(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self::Out<'a> {
+            len: usize,
+        ) -> Self::Out {
+            if len > mem::size_of::<libc::sockaddr_nl>() {
+                return None;
+            }
+
             // SAFETY: `sa_family` has been initialized by `Self::init_storage` or by the syscall.
             unsafe {
                 if addr_of!((*addr).nl_family).read() as libc::c_int != libc::AF_NETLINK {
@@ -2246,7 +2386,7 @@ pub mod netlink {
             }
 
             unsafe {
-                Some(&*(addr.cast()))
+                Some(*addr.cast())
             }
         }
 
@@ -2257,16 +2397,15 @@ pub mod netlink {
         }
     }
 
-    unsafe impl SockaddrFromRaw for *const NetlinkAddr {
+    unsafe impl SockaddrFromRaw for MaybeUninit<NetlinkAddress> {
         type Storage = libc::sockaddr_nl;
-        type Owned = MaybeUninit<NetlinkAddr>;
-        type Out<'a> = *const NetlinkAddr;
+        type Out = MaybeUninit<NetlinkAddress>;
 
-        unsafe fn from_raw<'a>(
+        unsafe fn from_raw(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self::Out<'a> {
-            addr.cast()
+            _: usize,
+        ) -> Self::Out {
+            unsafe { *addr.cast() }
         }
 
         fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
@@ -2274,19 +2413,19 @@ pub mod netlink {
         }
     }
 
-    impl private::SockaddrLikePriv for NetlinkAddr {}
+    impl private::SockaddrLikePriv for NetlinkAddress {}
 
-    unsafe impl SockaddrLike for NetlinkAddr {
+    unsafe impl SockaddrLike for NetlinkAddress {
         sockaddr_len_static!();
     }
 
-    impl AsRef<libc::sockaddr_nl> for NetlinkAddr {
+    impl AsRef<libc::sockaddr_nl> for NetlinkAddress {
         fn as_ref(&self) -> &libc::sockaddr_nl {
             &self.0
         }
     }
 
-    impl fmt::Display for NetlinkAddr {
+    impl fmt::Display for NetlinkAddress {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             write!(f, "pid: {} groups: {}", self.pid(), self.groups())
         }
@@ -2305,19 +2444,20 @@ pub mod alg {
     /// Socket address for the Linux kernel crypto API
     #[derive(Copy, Clone)]
     #[repr(transparent)]
-    pub struct AlgAddr(pub(in super::super) sockaddr_alg);
+    pub struct AlgAddress(pub(in super::super) sockaddr_alg);
 
-    addr_to_owned_option!(AlgAddr);
-
-    unsafe impl SockaddrFromRaw for AlgAddr {
+    unsafe impl SockaddrFromRaw for AlgAddress {
         type Storage = libc::sockaddr_alg;
-        type Owned = Option<AlgAddr>;
-        type Out<'a> = Option<&'a AlgAddr>;
+        type Out = Option<AlgAddress>;
 
-        unsafe fn from_raw<'a>(
+        unsafe fn from_raw(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self::Out<'a> {
+            len: usize,
+        ) -> Self::Out {
+            if len > mem::size_of::<libc::sockaddr_alg>() {
+                return None;
+            }
+
             // SAFETY: `sa_family` has been initialized by `Self::init_storage` or by the syscall.
             unsafe {
                 if addr_of!((*addr).salg_family).read() as libc::c_int != libc::AF_ALG {
@@ -2326,7 +2466,7 @@ pub mod alg {
             }
 
             unsafe {
-                Some(&*(addr.cast()))
+                Some(*addr.cast())
             }
         }
 
@@ -2337,16 +2477,15 @@ pub mod alg {
         }
     }
 
-    unsafe impl SockaddrFromRaw for *const AlgAddr {
+    unsafe impl SockaddrFromRaw for *const AlgAddress {
         type Storage = libc::sockaddr_alg;
-        type Owned = MaybeUninit<AlgAddr>;
-        type Out<'a> = *const AlgAddr;
+        type Out = MaybeUninit<AlgAddress>;
 
         unsafe fn from_raw<'a>(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self::Out<'a> {
-            addr.cast()
+            _: usize,
+        ) -> Self::Out {
+            unsafe { *addr.cast() }
         }
 
         fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
@@ -2354,20 +2493,20 @@ pub mod alg {
         }
     }
 
-    impl private::SockaddrLikePriv for AlgAddr {}
+    impl private::SockaddrLikePriv for AlgAddress {}
 
-    unsafe impl SockaddrLike for AlgAddr {
+    unsafe impl SockaddrLike for AlgAddress {
         sockaddr_len_static!();
     }
 
-    impl AsRef<libc::sockaddr_alg> for AlgAddr {
+    impl AsRef<libc::sockaddr_alg> for AlgAddress {
         fn as_ref(&self) -> &libc::sockaddr_alg {
             &self.0
         }
     }
 
     // , PartialEq, Eq, Debug, Hash
-    impl PartialEq for AlgAddr {
+    impl PartialEq for AlgAddress {
         fn eq(&self, other: &Self) -> bool {
             let (inner, other) = (self.0, other.0);
             (
@@ -2386,9 +2525,9 @@ pub mod alg {
         }
     }
 
-    impl Eq for AlgAddr {}
+    impl Eq for AlgAddress {}
 
-    impl Hash for AlgAddr {
+    impl Hash for AlgAddress {
         fn hash<H: Hasher>(&self, s: &mut H) {
             let inner = self.0;
             (
@@ -2402,9 +2541,9 @@ pub mod alg {
         }
     }
 
-    impl AlgAddr {
+    impl AlgAddress {
         /// Construct an `AF_ALG` socket from its cipher name and type.
-        pub fn new(alg_type: &str, alg_name: &str) -> AlgAddr {
+        pub fn new(alg_type: &str, alg_name: &str) -> AlgAddress {
             let mut addr: sockaddr_alg = unsafe { mem::zeroed() };
             addr.salg_family = AF_ALG as u16;
             addr.salg_type[..alg_type.len()]
@@ -2412,7 +2551,7 @@ pub mod alg {
             addr.salg_name[..alg_name.len()]
                 .copy_from_slice(alg_name.to_string().as_bytes());
 
-            AlgAddr(addr)
+            AlgAddress(addr)
         }
 
         /// Return the socket's cipher type, for example `hash` or `aead`.
@@ -2430,7 +2569,7 @@ pub mod alg {
         }
     }
 
-    impl fmt::Display for AlgAddr {
+    impl fmt::Display for AlgAddress {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             write!(
                 f,
@@ -2441,7 +2580,7 @@ pub mod alg {
         }
     }
 
-    impl fmt::Debug for AlgAddr {
+    impl fmt::Debug for AlgAddress {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             fmt::Display::fmt(self, f)
         }
@@ -2453,7 +2592,7 @@ feature! {
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod sys_control {
     use libc::{self, c_uchar};
-    use std::{fmt, mem, ptr};
+    use std::{fmt, mem};
     use std::os::unix::io::RawFd;
     use crate::{Errno, Result};
     use super::*;
@@ -2484,13 +2623,13 @@ pub mod sys_control {
 
     unsafe impl SockaddrFromRaw for SysControlAddr {
         type Storage = libc::sockaddr_ctl;
-        type Out<'a> = Option<SysControlAddr>;
+        type Out = Option<SysControlAddr>;
 
-        unsafe fn from_raw<'a>(
+        unsafe fn from_raw(
             addr: *const Self::Storage,
-            len: libc::socklen_t,
-        ) -> Self::Out<'a> {
-            if len != mem::size_of::<libc::sockaddr_ctl>() as libc::socklen_t {
+            len: usize,
+        ) -> Self::Out {
+            if len > mem::size_of::<libc::sockaddr_ctl>() {
                 return None;
             }
 
@@ -2501,7 +2640,9 @@ pub mod sys_control {
                 }
             }
 
-            Some(SysControlAddr(ptr::read(addr)))
+            unsafe {
+                Some(*addr.cast())
+            }
         }
 
         fn init_storage(buf: &mut MaybeUninit<Self::Storage>) {
@@ -2513,19 +2654,13 @@ pub mod sys_control {
 
     unsafe impl SockaddrFromRaw for MaybeUninit<SysControlAddr> {
         type Storage = libc::sockaddr_ctl;
-        type Out<'a> = MaybeUninit<SysControlAddr>;
+        type Out = MaybeUninit<SysControlAddr>;
 
-        unsafe fn from_raw<'a>(
+        unsafe fn from_raw(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self::Out<'a> {
-            let mut res = MaybeUninit::<SysControlAddr>::uninit();
-
-            unsafe {
-                ptr::copy_nonoverlapping(addr, res.as_mut_ptr().cast(), 1);
-            }
-
-            res
+            _: usize,
+        ) -> Self::Out {
+            unsafe { *addr.cast() }
         }
 
         fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
@@ -2606,9 +2741,9 @@ mod datalink {
     /// Hardware Address
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     #[repr(transparent)]
-    pub struct LinkAddr(pub(in super::super) libc::sockaddr_ll);
+    pub struct LinkAddress(pub(in super::super) libc::sockaddr_ll);
 
-    impl LinkAddr {
+    impl LinkAddress {
         /// Physical-layer protocol
         pub fn protocol(&self) -> u16 {
             self.0.sll_protocol
@@ -2648,7 +2783,7 @@ mod datalink {
         }
     }
 
-    impl fmt::Display for LinkAddr {
+    impl fmt::Display for LinkAddress {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             if let Some(addr) = self.addr() {
                 write!(f, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -2664,17 +2799,18 @@ mod datalink {
         }
     }
 
-    addr_to_owned_option!(LinkAddr);
-
-    unsafe impl SockaddrFromRaw for LinkAddr {
+    unsafe impl SockaddrFromRaw for LinkAddress {
         type Storage = libc::sockaddr_ll;
-        type Owned = Option<LinkAddr>;
-        type Out<'a> = Option<&'a LinkAddr>;
+        type Out = Option<LinkAddress>;
 
         unsafe fn from_raw<'a>(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self::Out<'a> {
+            len: usize,
+        ) -> Self::Out {
+            if len > mem::size_of::<libc::sockaddr_ll>() {
+                return None;
+            }
+
             // SAFETY: `sa_family` has been initialized by `Self::init_storage` or by the syscall.
             unsafe {
                 if addr_of!((*addr).sll_family).read() as libc::c_int != libc::AF_PACKET {
@@ -2683,7 +2819,7 @@ mod datalink {
             }
 
             unsafe {
-                Some(&*addr.cast())
+                Some(*addr.cast())
             }
         }
 
@@ -2694,16 +2830,15 @@ mod datalink {
         }
     }
 
-    unsafe impl SockaddrFromRaw for *const LinkAddr {
+    unsafe impl SockaddrFromRaw for MaybeUninit<LinkAddress> {
         type Storage = libc::sockaddr_ll;
-        type Owned = MaybeUninit<LinkAddr>;
-        type Out<'a> = *const LinkAddr;
+        type Out = MaybeUninit<LinkAddress>;
 
-        unsafe fn from_raw<'a>(
+        unsafe fn from_raw(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self::Out<'a> {
-            addr.cast()
+            _: usize,
+        ) -> Self::Out {
+            unsafe { *addr.cast() }
         }
 
         fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
@@ -2711,13 +2846,13 @@ mod datalink {
         }
     }
 
-    impl private::SockaddrLikePriv for LinkAddr {}
+    impl private::SockaddrLikePriv for LinkAddress {}
 
-    unsafe impl SockaddrLike for LinkAddr {
+    unsafe impl SockaddrLike for LinkAddress {
         sockaddr_len_static!();
     }
 
-    impl AsRef<libc::sockaddr_ll> for LinkAddr {
+    impl AsRef<libc::sockaddr_ll> for LinkAddress {
         fn as_ref(&self) -> &libc::sockaddr_ll {
             &self.0
         }
@@ -2743,38 +2878,102 @@ mod datalink {
     #![feature = "net"]
     use super::*;
 
+    fn link_true_len(addr: &libc::sockaddr_dl) -> usize {
+        const OFFSET: usize = offset_of!(libc::sockaddr_dl, sdl_data);
+
+        cfg_if! {
+            if #[cfg(target_os = "haiku")] {
+                OFFSET + addr.sdl_nlen as usize + addr.sdl_alen as usize
+            } else {
+                OFFSET + addr.sdl_nlen as usize + addr.sdl_alen as usize + addr.sdl_slen as usize
+            }
+        }
+    }
+
     /// Hardware Address
-    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-    #[repr(transparent)]
-    pub struct LinkAddr(pub(in super::super) libc::sockaddr_dl);
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    #[cfg_attr(not(doc), repr(transparent))]
+    pub struct LinkAddr {
+        slice: [u8],
+    }
 
     impl LinkAddr {
+        const fn from_raw_parts(data: *const libc::sockaddr_dl, len: usize) -> *const Self {
+            let data_ptr = data.cast::<u8>();
+            let slice_ptr = ptr::slice_from_raw_parts(data_ptr, len);
+
+            slice_ptr as *const Self
+        }
+
+        pub(super) const fn from_ref(data: &libc::sockaddr_dl, len: usize) -> &Self {
+            unsafe {
+                &*Self::from_raw_parts(data, len)
+            }
+        }
+
+        fn from_raw_parts_mut(data: *mut libc::sockaddr_dl, len: usize) -> *mut Self {
+            let data_ptr = data.cast::<u8>();
+            let slice_ptr = ptr::slice_from_raw_parts_mut(data_ptr, len);
+
+
+            slice_ptr as *mut Self
+        }
+
+        fn from_mut(data: &mut libc::sockaddr_dl, len: usize) -> &mut Self {
+            unsafe {
+                &mut *Self::from_raw_parts_mut(data, len)
+            }
+        }
+
+        fn inner(&self) -> &libc::sockaddr_dl {
+            unsafe {
+                &*self.as_ptr()
+            }
+        }
+
+        /// Returns the length of this link address.
+        pub fn len(&self) -> usize {
+            self.slice.len()
+        }
+
         /// interface index, if != 0, system given index for interface
         #[cfg(not(target_os = "haiku"))]
         pub fn ifindex(&self) -> usize {
-            self.0.sdl_index as usize
+            self.inner().sdl_index as usize
         }
 
         /// Datalink type
         #[cfg(not(target_os = "haiku"))]
         pub fn datalink_type(&self) -> u8 {
-            self.0.sdl_type
+            self.inner().sdl_type
         }
 
         /// MAC address start position
         pub fn nlen(&self) -> usize {
-            self.0.sdl_nlen as usize
+            self.inner().sdl_nlen as usize
         }
 
         /// link level address length
         pub fn alen(&self) -> usize {
-            self.0.sdl_alen as usize
+            self.inner().sdl_alen as usize
         }
 
         /// link layer selector length
         #[cfg(not(target_os = "haiku"))]
         pub fn slen(&self) -> usize {
-            self.0.sdl_slen as usize
+            self.inner().sdl_slen as usize
+        }
+
+        /// Returns the truncated length of this link address, only including
+        /// its name, address and selector.
+        ///
+        /// This value can be smaller than [`SockaddrLike::len`], but never be larger.
+        pub fn true_len(&self) -> usize {
+            let len = link_true_len(self.inner());
+
+            debug_assert!(len <= self.len());
+
+            len
         }
 
         /// if link level address length == 0,
@@ -2782,7 +2981,7 @@ mod datalink {
         pub fn is_empty(&self) -> bool {
             let nlen = self.nlen();
             let alen = self.alen();
-            let data_len = self.0.sdl_data.len();
+            let data_len = self.inner().sdl_data.len();
 
             alen == 0 || nlen + alen >= data_len
         }
@@ -2792,7 +2991,7 @@ mod datalink {
         #[allow(clippy::unnecessary_cast)]
         pub fn addr(&self) -> Option<[u8; 6]> {
             let nlen = self.nlen();
-            let data = self.0.sdl_data;
+            let data = self.inner().sdl_data;
 
             if self.is_empty() {
                 None
@@ -2806,6 +3005,52 @@ mod datalink {
                     data[nlen + 5] as u8,
                 ])
             }
+        }
+
+        /// Converts to an owned [`LinkAddress`].
+        ///
+        /// This method tries to copy as much data as possible from `self` into
+        /// the copy:
+        ///
+        /// - First, it tries to copy `self.len()` bytes into the new structure.
+        ///
+        /// - If `self.len()` is larger that the size of `libc::sockaddr_dl`, it
+        /// tries to copy `self.true_len()` bytes instead and adjusts its length.
+        ///
+        /// - If that fails too, it returns `None`.
+        pub fn to_owned(&self) -> Option<LinkAddress> {
+            cfg_if! {
+                if #[cfg(not(target_os = "illumos"))] {
+                    let mut addr = *self.inner();
+
+                    if self.len() <= mem::size_of::<libc::sockaddr_dl>() {
+                        addr.sdl_len = self.len() as _;
+                    } else if self.true_len() <= mem::size_of::<libc::sockaddr_dl>() {
+                        addr.sdl_len = self.true_len() as _;
+                    } else {
+                        return None;
+                    };
+
+                    Some(LinkAddress(addr))
+                } else {
+                    // For illumos, len and true_len are equal
+                    if self.len() <= mem::size_of::<libc::sockaddr_dl>() {
+                        Some(LinkAddress(*self.inner()))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+
+        /// Returns the inner pointer.
+        pub fn as_ptr(&self) -> *const libc::sockaddr_dl {
+            self.slice.as_ptr().cast()
+        }
+
+        /// Returns the inner mutable pointer.
+        pub fn as_mut_ptr(&mut self) -> *mut libc::sockaddr_dl {
+            self.slice.as_mut_ptr().cast()
         }
     }
 
@@ -2825,13 +3070,65 @@ mod datalink {
         }
     }
 
-    unsafe impl SockaddrFromRaw for Option<LinkAddr> {
+    /// Hardware Address
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    #[repr(transparent)]
+    pub struct LinkAddress(pub(in super::super) libc::sockaddr_dl);
+
+    impl std::ops::Deref for LinkAddress {
+        type Target = LinkAddr;
+
+        fn deref(&self) -> &Self::Target {
+            cfg_if! {
+                if #[cfg(not(target_os = "illumos"))] {
+                    let len = self.0.sdl_len as _;
+                } else {
+                    // On illumos, `sdl_len` is not available. That's the best guess we can make.
+                    let len = link_true_len(&self.0);
+                }
+            }
+
+            debug_assert!(len <= mem::size_of::<libc::sockaddr_dl>());
+
+            LinkAddr::from_ref(&self.0, len)
+        }
+    }
+
+    impl std::ops::DerefMut for LinkAddress {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            cfg_if! {
+                if #[cfg(not(target_os = "illumos"))] {
+                    let len = self.0.sdl_len as _;
+                } else {
+                    // On illumos, `sdl_len` is not available. That's the best guess we can make.
+                    let len = link_true_len(&self.0);
+                }
+            }
+
+            debug_assert!(len <= mem::size_of::<libc::sockaddr_dl>());
+
+            LinkAddr::from_mut(&mut self.0, len)
+        }
+    }
+
+    impl fmt::Display for LinkAddress {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            (**self).fmt(f)
+        }
+    }
+
+    unsafe impl SockaddrFromRaw for LinkAddress {
         type Storage = libc::sockaddr_dl;
+        type Out = Option<LinkAddress>;
 
         unsafe fn from_raw(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self {
+            len: usize,
+        ) -> Self::Out {
+            if len > mem::size_of::<libc::sockaddr_dl>() {
+                return None;
+            }
+
             // SAFETY: `sa_family` has been initialized by `Self::init_storage` or by the syscall.
             unsafe {
                 if addr_of!((*addr).sdl_family).read() as libc::c_int != libc::AF_LINK {
@@ -2839,7 +3136,9 @@ mod datalink {
                 }
             }
 
-            Some(LinkAddr(ptr::read(addr)))
+            unsafe {
+                Some(*addr.cast())
+            }
         }
 
         fn init_storage(buf: &mut MaybeUninit<Self::Storage>) {
@@ -2850,20 +3149,15 @@ mod datalink {
         }
     }
 
-    unsafe impl SockaddrFromRaw for MaybeUninit<LinkAddr> {
+    unsafe impl SockaddrFromRaw for MaybeUninit<LinkAddress> {
         type Storage = libc::sockaddr_dl;
+        type Out = MaybeUninit<LinkAddress>;
 
         unsafe fn from_raw(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self {
-            let mut res = MaybeUninit::<LinkAddr>::uninit();
-
-            unsafe {
-                ptr::copy_nonoverlapping(addr, res.as_mut_ptr().cast(), 1);
-            }
-
-            res
+            _: usize,
+        ) -> Self::Out {
+            unsafe { *addr.cast() }
         }
 
         fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
@@ -2871,13 +3165,15 @@ mod datalink {
         }
     }
 
-    impl private::SockaddrLikePriv for LinkAddr {}
+    impl private::SockaddrLikePriv for LinkAddress {}
 
-    unsafe impl SockaddrLike for LinkAddr {
-        sockaddr_len_static!();
+    unsafe impl SockaddrLike for LinkAddress {
+        fn len(&self) -> usize {
+            (**self).len()
+        }
     }
 
-    impl AsRef<libc::sockaddr_dl> for LinkAddr {
+    impl AsRef<libc::sockaddr_dl> for LinkAddress {
         fn as_ref(&self) -> &libc::sockaddr_dl {
             &self.0
         }
@@ -2900,19 +3196,20 @@ pub mod vsock {
     /// [vsock(7)](https://man7.org/linux/man-pages/man7/vsock.7.html)
     #[derive(Copy, Clone)]
     #[repr(transparent)]
-    pub struct VsockAddr(pub(in super::super) sockaddr_vm);
+    pub struct VsockAddress(pub(in super::super) sockaddr_vm);
 
-    addr_to_owned_option!(VsockAddr);
-
-    unsafe impl SockaddrFromRaw for VsockAddr {
+    unsafe impl SockaddrFromRaw for VsockAddress {
         type Storage = libc::sockaddr_vm;
-        type Owned = Option<VsockAddr>;
-        type Out<'a> = Option<&'a VsockAddr>;
+        type Out = Option<VsockAddress>;
 
-        unsafe fn from_raw<'a>(
+        unsafe fn from_raw(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self::Out<'a> {
+            len: usize,
+        ) -> Self::Out {
+            if len > mem::size_of::<libc::sockaddr_vm>() {
+                return None;
+            }
+
             // SAFETY: `sa_family` has been initialized by `Self::init_storage` or by the syscall.
             unsafe {
                 if addr_of!((*addr).svm_family).read() as libc::c_int != libc::AF_VSOCK {
@@ -2921,7 +3218,7 @@ pub mod vsock {
             }
 
             unsafe {
-                Some(&*addr.cast())
+                Some(*addr.cast())
             }
         }
 
@@ -2932,16 +3229,15 @@ pub mod vsock {
         }
     }
 
-    unsafe impl SockaddrFromRaw for *const VsockAddr {
+    unsafe impl SockaddrFromRaw for MaybeUninit<VsockAddress> {
         type Storage = libc::sockaddr_vm;
-        type Owned = MaybeUninit<VsockAddr>;
-        type Out<'a> = *const VsockAddr;
+        type Out = MaybeUninit<VsockAddress>;
 
-        unsafe fn from_raw<'a>(
+        unsafe fn from_raw(
             addr: *const Self::Storage,
-            _: libc::socklen_t,
-        ) -> Self::Out<'a> {
-            addr.cast()
+            _: usize,
+        ) -> Self::Out {
+            unsafe { *addr.cast() }
         }
 
         fn init_storage(_: &mut MaybeUninit<Self::Storage>) {
@@ -2949,19 +3245,19 @@ pub mod vsock {
         }
     }
 
-    impl private::SockaddrLikePriv for VsockAddr {}
+    impl private::SockaddrLikePriv for VsockAddress {}
 
-    unsafe impl SockaddrLike for VsockAddr {
+    unsafe impl SockaddrLike for VsockAddress {
         sockaddr_len_static!();
     }
 
-    impl AsRef<libc::sockaddr_vm> for VsockAddr {
+    impl AsRef<libc::sockaddr_vm> for VsockAddress {
         fn as_ref(&self) -> &libc::sockaddr_vm {
             &self.0
         }
     }
 
-    impl PartialEq for VsockAddr {
+    impl PartialEq for VsockAddress {
         #[cfg(any(target_os = "android", target_os = "linux"))]
         fn eq(&self, other: &Self) -> bool {
             let (inner, other) = (self.0, other.0);
@@ -2976,9 +3272,9 @@ pub mod vsock {
         }
     }
 
-    impl Eq for VsockAddr {}
+    impl Eq for VsockAddress {}
 
-    impl Hash for VsockAddr {
+    impl Hash for VsockAddress {
         #[cfg(any(target_os = "android", target_os = "linux"))]
         fn hash<H: Hasher>(&self, s: &mut H) {
             let inner = self.0;
@@ -2995,9 +3291,9 @@ pub mod vsock {
     ///
     /// The address for AF_VSOCK socket is defined as a combination of a
     /// 32-bit Context Identifier (CID) and a 32-bit port number.
-    impl VsockAddr {
+    impl VsockAddress {
         /// Construct a `VsockAddr` from its raw fields.
-        pub fn new(cid: u32, port: u32) -> VsockAddr {
+        pub fn new(cid: u32, port: u32) -> VsockAddress {
             let mut addr: sockaddr_vm = unsafe { mem::zeroed() };
             addr.svm_family = libc::AF_VSOCK as sa_family_t;
             addr.svm_cid = cid;
@@ -3007,7 +3303,7 @@ pub mod vsock {
             {
              addr.svm_len =  std::mem::size_of::<sockaddr_vm>() as u8;
             }
-            VsockAddr(addr)
+            VsockAddress(addr)
         }
 
         /// Context Identifier (CID)
@@ -3021,13 +3317,13 @@ pub mod vsock {
         }
     }
 
-    impl fmt::Display for VsockAddr {
+    impl fmt::Display for VsockAddress {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             write!(f, "cid: {} port: {}", self.cid(), self.port())
         }
     }
 
-    impl fmt::Debug for VsockAddr {
+    impl fmt::Debug for VsockAddress {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             fmt::Display::fmt(self, f)
         }
@@ -3038,42 +3334,38 @@ macro_rules! raw_address_conv {
     ($fname:ident, $nixty:tt, $libcty:ident, $af:ident, $doc:tt) => {
         #[doc = $doc]
         pub fn $fname(&self) -> Option<&$nixty> {
-            cfg_if! {
-                if #[cfg(any(
-                    target_os = "android",
-                    target_os = "fuchsia",
-                    target_os = "illumos",
-                    target_os = "linux",
-                    target_os = "redox",
-                ))] {
-                    let len = mem::size_of::<libc::$libcty>();
-                } else {
-                    let len = unsafe { (*self.addr.as_ptr()).sa_len };
-                }
+            if self.family() != AddressFamily::$af {
+                return None;
             }
 
             unsafe {
-                <$nixty>::from_raw(self.addr.as_ptr().cast(), len as _)
+                Some(&*(self.as_ptr().cast()))
             }
         }
     };
 }
 
 /// Non-owning pointer to a raw socket address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// In contrast to [`Addr`], this type may or may not have a
+/// a length associated with it, depending on the platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct RawAddress<'a> {
-    addr: NonNull<libc::sockaddr>,
-    _a: PhantomData<&'a ()>,
+pub struct RawAddr<'a> {
+    addr: &'a libc::sockaddr,
 }
 
-impl<'a> RawAddress<'a> {
+#[allow(clippy::len_without_is_empty)]
+impl<'a> RawAddr<'a> {
+    /// Creates a new `RawAddr` from a reference to a socket address.
+    ///
+    /// # Safety
+    ///
+    /// The reference must be castable to the concrete type of the address,
+    /// based on its address family.
     #[allow(unused)]
-    pub(crate) unsafe fn new(addr: *const libc::sockaddr) -> Option<Self> {
-        Some(Self {
-            addr: NonNull::new(addr.cast_mut())?,
-            _a: PhantomData,
-        })
+    pub(crate) const unsafe fn new(addr: &'a libc::sockaddr) -> Option<Self> {
+        Some(Self { addr })
     }
 
     /// Returns a pointer to the address that is valid for reads.
@@ -3081,20 +3373,16 @@ impl<'a> RawAddress<'a> {
     /// The pointer can be casted to a pointer to the concrete type of the address,
     /// based on its address family.
     pub const fn as_ptr(&self) -> *const libc::sockaddr {
-        self.addr.as_ptr().cast_const()
+        self.addr as *const _
     }
 
     /// Returns the address family of the address.
-
-    // FIXME: Can be a const fn since 1.73.0
-    pub fn family(&self) -> AddressFamily {
-        AddressFamily::of(unsafe { self.addr.as_ref() })
+    pub const fn family(&self) -> AddressFamily {
+        AddressFamily::of(self.addr)
     }
 
-    /// Associates the address with a length.
-    ///
-    /// On BSD-like systems, this is a no-op.
-    pub fn to_sized(&self) -> RawAddressSized<'a> {
+    /// Returns the length of the address, if possible to derive.
+    pub fn len(&self) -> Option<usize> {
         cfg_if! {
             if #[cfg(any(
                 target_os = "android",
@@ -3103,15 +3391,15 @@ impl<'a> RawAddress<'a> {
                 target_os = "linux",
                 target_os = "redox",
             ))] {
-                let len = match self.family() {
+                match self.family() {
                     #[cfg(any(target_os = "android", target_os = "linux"))]
-                    AddressFamily::ALG => mem::size_of::<libc::sockaddr_alg>(),
+                    AddressFamily::ALG => Some(mem::size_of::<libc::sockaddr_alg>()),
                     #[cfg(feature = "net")]
-                    AddressFamily::INET => mem::size_of::<libc::sockaddr_in>(),
+                    AddressFamily::INET => Some(mem::size_of::<libc::sockaddr_in>()),
                     #[cfg(feature = "net")]
-                    AddressFamily::INET6 => mem::size_of::<libc::sockaddr_in6>(),
+                    AddressFamily::INET6 => Some(mem::size_of::<libc::sockaddr_in6>()),
                     #[cfg(any(target_os = "android", target_os = "linux"))]
-                    AddressFamily::NETLINK => mem::size_of::<libc::sockaddr_nl>(),
+                    AddressFamily::NETLINK => Some(mem::size_of::<libc::sockaddr_nl>()),
                     #[cfg(all(
                         feature = "net",
                         any(
@@ -3120,36 +3408,39 @@ impl<'a> RawAddress<'a> {
                             target_os = "linux",
                         ),
                     ))]
-                    AddressFamily::PACKET => mem::size_of::<libc::sockaddr_ll>(),
-                    AddressFamily::UNIX => {
-                        let addr = self.addr.as_ptr().cast::<libc::sockaddr_un>();
-                        let c_str = unsafe { std::ffi::CStr::from_ptr(addr_of!((*addr).sun_path).cast()) };
-
-                        c_str.to_bytes().len() + offset_of!(libc::sockaddr_un, sun_path)
+                    AddressFamily::PACKET => Some(mem::size_of::<libc::sockaddr_ll>()),
+                    #[cfg(all(
+                        feature = "net",
+                        target_os = "illumos",
+                    ))]
+                    AddressFamily::LINK => {
+                        let ptr = self.as_ptr().cast::<libc::sockaddr_dl>();
+                        let nlen = unsafe { addr_of!((*ptr).sdl_nlen).read() as usize };
+                        let alen = unsafe { addr_of!((*ptr).sdl_alen).read() as usize };
+                        let slen = unsafe { addr_of!((*ptr).sdl_slen).read() as usize };
+                        Some(offset_of!(libc::sockaddr_dl, sdl_data) + nlen + alen + slen)
                     }
                     #[cfg(any(target_os = "android", target_os = "linux"))]
-                    AddressFamily::VSOCK => mem::size_of::<libc::sockaddr_vm>(),
-                    _ => 0,
-                };
-
-                RawAddressSized { addr: self.addr, len: len as _, _a: PhantomData }
+                    AddressFamily::VSOCK => Some(mem::size_of::<libc::sockaddr_vm>()),
+                    _ => None,
+                }
             } else {
-                RawAddressSized { addr: self.addr, _a: PhantomData }
+                Some(self.addr.sa_len as _)
             }
         }
     }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    raw_address_conv!(to_alg, AlgAddr, sockaddr_alg, ALG, "Converts to [`AlgAddr`], if the address family matches.");
+    raw_address_conv!(to_alg, AlgAddress, sockaddr_alg, ALG, "Converts to [`AlgAddress`], if the address family matches.");
 
     #[cfg(feature = "net")]
-    raw_address_conv!(to_sockaddr_in, SockaddrIn, sockaddr_in, INET, "Converts to [`SockaddrIn`], if the address family matches.");
+    raw_address_conv!(to_ipv4, Ipv4Address, sockaddr_in, INET, "Converts to [`Ipv4Address`], if the address family matches.");
 
     #[cfg(feature = "net")]
-    raw_address_conv!(to_sockaddr_in6, SockaddrIn6, sockaddr_in6, INET6, "Converts to [`SockaddrIn6`], if the address family matches.");
+    raw_address_conv!(to_ipv6, Ipv6Address, sockaddr_in6, INET6, "Converts to [`Ipv6Address`], if the address family matches.");
 
     #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
-    raw_address_conv!(to_vsock, VsockAddr, sockaddr_vm, VSOCK, "Converts to [`VsockAddr`], if the address family matches.");
+    raw_address_conv!(to_vsock, VsockAddress, sockaddr_vm, VSOCK, "Converts to [`VsockAddress`], if the address family matches.");
 
     #[cfg(all(
         feature = "net",
@@ -3165,7 +3456,19 @@ impl<'a> RawAddress<'a> {
             target_os = "openbsd",
         ),
     ))]
-    raw_address_conv!(to_link, LinkAddr, sockaddr_dl, LINK, "Converts to [`LinkAddr`], if the address family matches.");
+    /// Converts to [`LinkAddr`], if the address family matches.
+    pub fn to_link(&self) -> Option<&LinkAddr> {
+        if self.family() != AddressFamily::LINK {
+            return None;
+        }
+
+        unsafe {
+            Some(LinkAddr::from_ref(
+                &*self.as_ptr().cast(),
+                self.len().unwrap(),
+            ))
+        }
+    }
 
     #[cfg(all(
         feature = "net",
@@ -3175,116 +3478,54 @@ impl<'a> RawAddress<'a> {
             target_os = "linux",
         ),
     ))]
-    raw_address_conv!(to_link, LinkAddr, sockaddr_ll, PACKET, "Converts to [`LinkAddr`], if the address family matches.");
+    raw_address_conv!(to_link, LinkAddress, sockaddr_ll, PACKET, "Converts to [`LinkAddress`], if the address family matches.");
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    raw_address_conv!(to_netlink, NetlinkAddr, sockaddr_nl, NETLINK, "Converts to [`NetlinkAddr`], if the address family matches.");
+    raw_address_conv!(to_netlink, NetlinkAddress, sockaddr_nl, NETLINK, "Converts to [`NetlinkAddress`], if the address family matches.");
 
     #[cfg(all(
         feature = "ioctl",
         any(target_os = "ios", target_os = "macos")
     ))]
-    raw_address_conv!(as_sys_control, SysControlAddr, sockaddr_ctl, SYSTEM, "Converts to [`SysControlAddr`], if the address family matches.");
-}
+    raw_address_conv!(to_sys_control, SysControlAddr, sockaddr_ctl, SYSTEM, "Converts to [`SysControlAddr`], if the address family matches.");
 
-impl<'a> fmt::Display for RawAddress<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.family() {
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            AddressFamily::ALG => self.to_alg().unwrap().fmt(f),
-            #[cfg(feature = "net")]
-            AddressFamily::INET => self.to_sockaddr_in().unwrap().fmt(f),
-            #[cfg(feature = "net")]
-            AddressFamily::INET6 => self.to_sockaddr_in6().unwrap().fmt(f),
-            #[cfg(any(
-                target_os = "dragonfly",
-                target_os = "freebsd",
-                target_os = "ios",
-                target_os = "macos",
-                target_os = "illumos",
-                target_os = "netbsd",
-                target_os = "openbsd"
-            ))]
-            #[cfg(feature = "net")]
-            AddressFamily::LINK => self.to_link().unwrap().fmt(f),
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            AddressFamily::NETLINK => self.to_netlink().unwrap().fmt(f),
-            #[cfg(any(
-                target_os = "android",
-                target_os = "linux",
-                target_os = "fuchsia"
-            ))]
-            #[cfg(feature = "net")]
-            AddressFamily::PACKET => self.to_link().unwrap().fmt(f),
-            #[cfg(any(target_os = "ios", target_os = "macos"))]
-            #[cfg(feature = "ioctl")]
-            AddressFamily::SYSTEM => self.as_sys_control().unwrap().fmt(f),
-            AddressFamily::UNIX => self.to_sized().to_unix().unwrap().fmt(f),
-            #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
-            AddressFamily::VSOCK => self.to_vsock().unwrap().fmt(f),
-            _ => "<Address family unspecified>".fmt(f),
-        }
-    }
-}
-
-unsafe impl<'a> Send for RawAddress<'a> {}
-unsafe impl<'a> Sync for RawAddress<'a> {}
-
-/// Non-owning sized pointer to a raw socket address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(C)]
-pub struct RawAddressSized<'a> {
-    addr: NonNull<libc::sockaddr>,
-    #[cfg(any(
+    /// Converts to [`UnixAddr`], if the address family matches.
+    #[cfg(not(any(
         target_os = "android",
         target_os = "fuchsia",
         target_os = "illumos",
         target_os = "linux",
         target_os = "redox",
-))]
-    len: libc::socklen_t,
-    _a: PhantomData<&'a ()>,
-}
-
-impl<'a> RawAddressSized<'a> {
-    /// Converts to [`UnixAddr`], if the address family matches.
-    pub fn to_unix(&self) -> Option<UnixAddress> {
+    )))]
+    pub fn to_unix(&self) -> Option<&UnixAddr> {
         if self.family() != AddressFamily::UNIX {
             return None;
         }
 
-        let addr = self.addr.as_ptr().cast::<libc::sockaddr_un>();
+        unsafe {
+            Some(UnixAddr::from_ref(
+                &*self.as_ptr().cast(),
+                self.len().unwrap(),
+            ))
+        }
+    }
 
-        cfg_if! {
-            if #[cfg(any(
-                target_os = "android",
-                target_os = "fuchsia",
-                target_os = "illumos",
-                target_os = "linux",
-                target_os = "redox",
-            ))] {
-                let c_str = unsafe { std::ffi::CStr::from_ptr(addr_of!((*addr).sun_path).cast()) };
+    /// Converts to [`Addr`], if its length can be derived.
+    pub fn to_sockaddr(&self) -> Option<&Addr> {
+        self.len().map(|l| unsafe {
+            Addr::from_ref(&*self.as_ptr().cast(), l)
+        })
+    }
+}
 
-                let sun_len = c_str.to_bytes().len() + offset_of!(libc::sockaddr_un, sun_path);
-
-                Some(UnixAddress { sun: unsafe { *addr }, sun_len: sun_len as _ })
-            } else {
-                Some(UnixAddress { sun: unsafe { *addr } })
-            }
+impl<'a> fmt::Display for RawAddr<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.to_sockaddr() {
+            Some(sa) => sa.fmt(f),
+            None => "<unsupported>".fmt(f),
         }
     }
 }
-
-impl<'a> std::ops::Deref for RawAddressSized<'a> {
-    type Target = RawAddress<'a>;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*(self as *const _ as *const _) }
-    }
-}
-
-unsafe impl<'a> Send for RawAddressSized<'a> {}
-unsafe impl<'a> Sync for RawAddressSized<'a> {}
 
 #[cfg(test)]
 mod tests {
@@ -3315,12 +3556,7 @@ mod tests {
     mod link {
         #![allow(clippy::cast_ptr_alignment)]
 
-        #[cfg(any(
-            target_os = "ios",
-            target_os = "macos",
-            target_os = "illumos"
-        ))]
-        use super::super::super::socklen_t;
+        #[allow(unused_imports)]
         use super::*;
 
         /// Don't panic when trying to display an empty datalink address
@@ -3334,11 +3570,13 @@ mod tests {
         ))]
         #[test]
         fn test_datalink_display() {
-            use super::super::LinkAddr;
+            use super::super::LinkAddress;
             use std::mem;
 
-            let la = LinkAddr(libc::sockaddr_dl {
-                sdl_len: 56,
+            let len = offset_of!(libc::sockaddr_dl, sdl_data) + 3;
+
+            let la = LinkAddress(libc::sockaddr_dl {
+                sdl_len: len as _,
                 sdl_family: 18,
                 sdl_index: 5,
                 sdl_type: 24,
@@ -3356,9 +3594,9 @@ mod tests {
             let bytes =
                 [20i8, 18, 1, 0, 24, 3, 0, 0, 108, 111, 48, 0, 0, 0, 0, 0];
             let sa = bytes.as_ptr().cast();
-            let len = bytes.len() as socklen_t;
+            let len = bytes.len();
             let sock_addr =
-                unsafe { SockaddressStorage::from_raw(sa, len) };
+                unsafe { &*Addr::from_raw_parts(sa, len) };
             assert_eq!(sock_addr.family(), AddressFamily::LINK);
             match sock_addr.to_link() {
                 Some(dl) => {
@@ -3377,10 +3615,10 @@ mod tests {
             ];
             let ptr = bytes.as_ptr();
             let sa = ptr as *const libc::sockaddr;
-            let len = bytes.len() as socklen_t;
+            let len = bytes.len();
 
             let sock_addr =
-                unsafe { SockaddressStorage::from_raw(sa.cast(), len) };
+                unsafe { &*Addr::from_raw_parts(sa.cast(), len) };
             assert_eq!(sock_addr.family(), AddressFamily::LINK);
             match sock_addr.to_link() {
                 Some(dl) => {
@@ -3396,8 +3634,8 @@ mod tests {
             let bytes = [25u8, 0, 0, 0, 6, 0, 6, 0, 24, 101, 144, 221, 76, 176];
             let ptr = bytes.as_ptr();
             let sa = ptr as *const libc::sockaddr;
-            let len = bytes.len() as socklen_t;
-            let sock_addr = unsafe { SockaddressStorage::from_raw(sa.cast(), len) };
+            let len = bytes.len();
+            let sock_addr = unsafe { &*Addr::from_raw_parts(sa.cast(), len) };
 
             assert_eq!(sock_addr.family(), AddressFamily::LINK);
 
@@ -3407,27 +3645,47 @@ mod tests {
             );
         }
 
+        #[cfg(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "illumos",
+            target_os = "netbsd",
+            // haiku doesn't support `getifaddrs`
+            // aix doesn't support `getifaddrs`
+            target_os = "openbsd",
+        ))]
         #[test]
-        fn size() {
-            #[cfg(any(
-                target_os = "aix",
-                target_os = "dragonfly",
-                target_os = "freebsd",
-                target_os = "ios",
-                target_os = "macos",
-                target_os = "netbsd",
-                target_os = "illumos",
-                target_os = "openbsd",
-                target_os = "haiku"
-            ))]
-            let l = mem::size_of::<libc::sockaddr_dl>();
-            #[cfg(any(
-                target_os = "android",
-                target_os = "fuchsia",
-                target_os = "linux"
-            ))]
-            let l = mem::size_of::<libc::sockaddr_ll>();
-            assert_eq!(LinkAddr::size() as usize, l);
+        fn test_to_owned() {
+            let ifaddrs = crate::ifaddrs::getifaddrs().unwrap();
+
+            for addr in ifaddrs.iter().map(|ifa| ifa.address).filter_map(|a| a.filter(|a| a.family() == AddressFamily::LINK)) {
+                let link_addr: &LinkAddr = addr.to_link().unwrap();
+
+                // On FreeBSD, the length gets rounded up to the next multiple
+                // of 8 bytes, which is 56 bytes.
+                //
+                // Source: https://github.com/freebsd/freebsd-src/blob/dcc4d2939f789a6d1f272ffeab2068ba2b7525ea/lib/libc/net/getifaddrs.c#L61
+                //
+                // That means, that its length is larger than 54, the size of
+                // `libc::sockaddr_dl`.
+                #[cfg(target_os = "freebsd")]
+                assert_eq!(link_addr.len(), 56);
+
+                let owned = link_addr.to_owned().unwrap();
+
+                assert!(owned.len() <= std::mem::size_of::<LinkAddress>());
+
+                // On FreeBSD, because `56 > size_of::<libc::sockaddr_dl>()`,
+                // the length has been truncated to its true length.
+                #[cfg(target_os = "fresbsd")]
+                assert_eq!(owned.len(), owned.true_len());
+
+                // We can dereference `owned` and get the same result when
+                // displaying it.
+                assert_eq!(format!("{}", owned), format!("{}", &*owned));
+            }
         }
     }
 
@@ -3438,16 +3696,8 @@ mod tests {
         #[test]
         fn display() {
             let s = "127.0.0.1:8080";
-            let addr = SockaddrIn::from_str(s).unwrap();
+            let addr = Ipv4Address::from_str(s).unwrap();
             assert_eq!(s, format!("{addr}"));
-        }
-
-        #[test]
-        fn size() {
-            assert_eq!(
-                mem::size_of::<libc::sockaddr_in>(),
-                SockaddrIn::size() as usize
-            );
         }
     }
 
@@ -3458,23 +3708,15 @@ mod tests {
         #[test]
         fn display() {
             let s = "[1234:5678:90ab:cdef::1111:2222]:8080";
-            let addr = SockaddrIn6::from_str(s).unwrap();
+            let addr = Ipv6Address::from_str(s).unwrap();
             assert_eq!(s, format!("{addr}"));
-        }
-
-        #[test]
-        fn size() {
-            assert_eq!(
-                mem::size_of::<libc::sockaddr_in6>(),
-                SockaddrIn6::size() as usize
-            );
         }
 
         #[test]
         // Ensure that we can convert to-and-from std::net variants without change.
         fn to_and_from() {
             let s = "[1234:5678:90ab:cdef::1111:2222]:8080";
-            let mut nix_sin6 = SockaddrIn6::from_str(s).unwrap();
+            let mut nix_sin6 = Ipv6Address::from_str(s).unwrap();
             nix_sin6.0.sin6_flowinfo = 0x12345678;
             nix_sin6.0.sin6_scope_id = 0x9abcdef0;
 
@@ -3484,6 +3726,7 @@ mod tests {
     }
 
     mod unixaddr {
+        #[allow(unused_imports)]
         use super::*;
 
         #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -3499,14 +3742,6 @@ mod tests {
                 116, 101, 115, 116,
             ];
             assert_eq!(sun_path1, sun_path2);
-        }
-
-        #[test]
-        fn size() {
-            assert_eq!(
-                mem::size_of::<libc::sockaddr_un>(),
-                UnixAddress::size() as usize
-            );
         }
     }
 }

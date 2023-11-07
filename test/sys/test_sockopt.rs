@@ -110,13 +110,13 @@ fn test_so_buf() {
 
 #[test]
 fn test_so_tcp_maxseg() {
-    use nix::sys::socket::{accept, bind, connect, listen, SockaddrIn};
+    use nix::sys::socket::{accept, bind, connect, listen, Ipv4Address};
     use nix::unistd::write;
     use std::net::SocketAddrV4;
     use std::str::FromStr;
 
     let std_sa = SocketAddrV4::from_str("127.0.0.1:4001").unwrap();
-    let sock_addr = SockaddrIn::from(std_sa);
+    let sock_addr = Ipv4Address::from(std_sa);
 
     let rsock = socket(
         AddressFamily::INET,
@@ -284,7 +284,7 @@ fn test_so_tcp_keepalive() {
 #[cfg(any(target_os = "android", target_os = "linux"))]
 #[cfg_attr(qemu, ignore)]
 fn test_get_mtu() {
-    use nix::sys::socket::{bind, connect, SockaddrIn};
+    use nix::sys::socket::{bind, connect, Ipv4Address};
     use std::net::SocketAddrV4;
     use std::str::FromStr;
 
@@ -300,8 +300,8 @@ fn test_get_mtu() {
     .unwrap();
 
     // Bind and initiate connection
-    bind(usock.as_raw_fd(), &SockaddrIn::from(std_sa)).unwrap();
-    connect(usock.as_raw_fd(), &SockaddrIn::from(std_sb)).unwrap();
+    bind(usock.as_raw_fd(), &Ipv4Address::from(std_sa)).unwrap();
+    connect(usock.as_raw_fd(), &Ipv4Address::from(std_sb)).unwrap();
 
     // Loopback connections have 2^16 - the maximum - MTU
     assert_eq!(getsockopt(&usock, sockopt::IpMtu), Ok(u16::MAX as i32))

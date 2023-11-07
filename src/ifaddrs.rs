@@ -13,24 +13,24 @@ use std::mem::{self, MaybeUninit};
 use std::option::Option;
 
 use crate::net::if_::*;
-use crate::sys::socket::{RawAddress, SockaddressStorage};
+use crate::sys::socket::{Address, RawAddr};
 use crate::{Errno, Result};
 
 /// Describes a single address for an interface as returned by `getifaddrs`.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterfaceAddress<'a> {
     /// Name of the network interface
     pub interface_name: String,
     /// Flags as from `SIOCGIFFLAGS` ioctl
     pub flags: InterfaceFlags,
     /// Network address of this interface
-    pub address: Option<RawAddress<'a>>,
+    pub address: Option<RawAddr<'a>>,
     /// Netmask of this interface
-    pub netmask: Option<RawAddress<'a>>,
+    pub netmask: Option<RawAddr<'a>>,
     /// Broadcast address of this interface, if applicable
-    pub broadcast: Option<RawAddress<'a>>,
+    pub broadcast: Option<RawAddr<'a>>,
     /// Point-to-point destination address
-    pub destination: Option<RawAddress<'a>>,
+    pub destination: Option<RawAddr<'a>>,
 }
 
 cfg_if! {
@@ -49,8 +49,8 @@ impl<'a> InterfaceAddress<'a> {
     /// Create an `InterfaceAddress` from the libc struct.
     fn from_libc_ifaddrs(info: &libc::ifaddrs) -> InterfaceAddress {
         let ifname = unsafe { ffi::CStr::from_ptr(info.ifa_name) };
-        let address = unsafe { RawAddress::new(info.ifa_addr) };
-        let netmask = unsafe { RawAddress::new(info.ifa_netmask) };
+        let address = unsafe { RawAddr::new(&*info.ifa_addr) };
+        let netmask = unsafe { RawAddr::new(&*info.ifa_netmask) };
         let mut addr = InterfaceAddress {
             interface_name: ifname.to_string_lossy().to_string(),
             flags: InterfaceFlags::from_bits_truncate(info.ifa_flags as i32),
@@ -62,9 +62,9 @@ impl<'a> InterfaceAddress<'a> {
 
         let ifu = get_ifu_from_sockaddr(info);
         if addr.flags.contains(InterfaceFlags::IFF_POINTOPOINT) {
-            addr.destination = unsafe { RawAddress::new(ifu) };
+            addr.destination = unsafe { RawAddr::new(&*ifu) };
         } else if addr.flags.contains(InterfaceFlags::IFF_BROADCAST) {
-            addr.broadcast = unsafe { RawAddress::new(ifu) };
+            addr.broadcast = unsafe { RawAddr::new(&*ifu) };
         }
 
         addr
@@ -180,10 +180,10 @@ mod tests {
                 continue;
             };
             if sock.family() == AddressFamily::INET {
-                let _ = sock.to_sockaddr_in().unwrap();
+                let _ = sock.to_ipv4().unwrap();
                 return;
             } else if sock.family() == AddressFamily::INET6 {
-                let _ = sock.to_sockaddr_in6().unwrap();
+                let _ = sock.to_ipv6().unwrap();
                 return;
             }
         }

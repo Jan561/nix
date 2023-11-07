@@ -16,9 +16,6 @@ use libc::{
 };
 #[cfg(not(target_os = "redox"))]
 use std::io::{IoSlice, IoSliceMut};
-
-#[cfg(not(target_os = "redox"))]
-#[cfg(feature = "uio")]
 use std::mem::MaybeUninit;
 #[cfg(feature = "net")]
 use std::net;
@@ -38,26 +35,38 @@ pub mod sockopt;
  *
  */
 
-use self::addr::AddrToOwned;
-pub use self::addr::{AddressFamily, InvalidAddressFamilyError, SockaddrFromRaw, SockaddrLike, SockaddressStorage, NoAddress, UnixAddr, UnixAddress, RawAddress, RawAddressSized};
+pub use self::addr::{AddressFamily, InvalidAddressFamilyError, SockaddrFromRaw, SockaddrLike, Addr, Address, NoAddress, UnixAddr, UnixAddress, RawAddr};
 
 #[cfg(not(any(
     target_os = "solaris",
     target_os = "redox",
 )))]
 #[cfg(feature = "net")]
-pub use self::addr::{LinkAddr, SockaddrIn, SockaddrIn6};
+pub use self::addr::{LinkAddress, Ipv4Address, Ipv6Address};
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "illumos",
+    target_os = "netbsd",
+    target_os = "haiku",
+    target_os = "aix",
+    target_os = "openbsd"
+))]
+#[cfg(feature = "net")]
+pub use self::addr::LinkAddr;
 #[cfg(any(
     target_os = "solaris",
     target_os = "redox",
 ))]
 #[cfg(feature = "net")]
-pub use self::addr::{SockaddrIn, SockaddrIn6};
+pub use self::addr::{Ipv4Address, Ipv6Address};
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
-pub use crate::sys::socket::addr::alg::AlgAddr;
+pub use crate::sys::socket::addr::alg::AlgAddress;
 #[cfg(any(target_os = "android", target_os = "linux"))]
-pub use crate::sys::socket::addr::netlink::NetlinkAddr;
+pub use crate::sys::socket::addr::netlink::NetlinkAddress;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 #[cfg(feature = "ioctl")]
 pub use crate::sys::socket::addr::sys_control::SysControlAddr;
@@ -66,7 +75,7 @@ pub use crate::sys::socket::addr::sys_control::SysControlAddr;
     target_os = "linux",
     target_os = "macos"
 ))]
-pub use crate::sys::socket::addr::vsock::VsockAddr;
+pub use crate::sys::socket::addr::vsock::VsockAddress;
 
 #[cfg(all(feature = "uio", not(target_os = "redox")))]
 pub use libc::{cmsghdr, msghdr};
@@ -610,16 +619,18 @@ macro_rules! cmsg_space {
     }};
 }
 
-/// Creates a [`CmsgVecRead`] with the capacity needed for the provided arguments.
+/// Creates a [`Vec<MaybeUninit<u8>>`] with the capacity and length needed for **receiving**
+/// the provided arguments.
 ///
 /// The arguments are the names of the variants of [`ControlMessageOwnedSpace`].
 ///
 /// # Example
 ///
 /// ```
-/// # use nix::{cmsg_space, cmsg_vec, sys::socket::CmsgVecRead};
+/// # use nix::{cmsg_space, cmsg_vec};
 /// let cmsg = cmsg_vec![ScmRights(2), ScmTimestamp];
 ///
+/// assert_eq!(cmsg.len(), cmsg_space![ScmRights(2), ScmTimestamp]);
 /// assert_eq!(cmsg.capacity(), cmsg_space![ScmRights(2), ScmTimestamp]);
 /// ```
 #[macro_export]
@@ -627,7 +638,34 @@ macro_rules! cmsg_vec {
     ($($x:ident $(($arg:expr))? ),* $(,)?) => {{
         const SPACE: usize = $crate::cmsg_space![$($x $(($arg))? ),*];
 
-        $crate::sys::socket::CmsgVecRead::with_capacity(SPACE)
+        let mut buf = <std::vec::Vec<std::mem::MaybeUninit<u8>>>::with_capacity(SPACE);
+
+        // SAFETY: `MaybeUninit` doesn't require initialization, and the length matches
+        // the capacity.
+        unsafe {
+            buf.set_len(SPACE);
+        }
+
+        buf
+    }};
+}
+
+// FIXME (2023-11-13): the module-internal test `recvmmsg2` requires a version of the macro without
+// an absolute path to `cmsg_space!`. This workaround is necessary until the macro resolution
+// of the compiler isn't as horrendous as it is currently.
+macro_rules! cmsg_vec_internal {
+    ($($x:ident $(($arg:expr))? ),* $(,)?) => {{
+        const SPACE: usize = cmsg_space![$($x $(($arg))? ),*];
+
+        let mut buf = <std::vec::Vec<std::mem::MaybeUninit<u8>>>::with_capacity(SPACE);
+
+        // SAFETY: `MaybeUninit` doesn't require initialization, and the length matches
+        // the capacity.
+        unsafe {
+            buf.set_len(SPACE);
+        }
+
+        buf
     }};
 }
 
@@ -713,9 +751,9 @@ pub enum ControlMessageOwned {
     ///     SockFlag::empty(),
     ///     None).unwrap();
     /// setsockopt(&in_socket, sockopt::ReceiveTimestamp, &true).unwrap();
-    /// let localhost = SockaddrIn::from_str("127.0.0.1:0").unwrap();
+    /// let localhost = Ipv4Address::from_str("127.0.0.1:0").unwrap();
     /// bind(in_socket.as_raw_fd(), &localhost).unwrap();
-    /// let address: Option<SockaddrIn> = getsockname(in_socket.as_raw_fd()).unwrap();
+    /// let address: Option<Ipv4Address> = getsockname::<Ipv4Address>(in_socket.as_raw_fd()).unwrap();
     /// let address = address.unwrap();
     /// // Get initial time
     /// let time0 = SystemTime::now();
@@ -726,17 +764,16 @@ pub enum ControlMessageOwned {
     ///     in_socket.as_raw_fd(),
     ///     Some(&address),
     ///     &iov,
-    ///     CmsgEmpty::write(),
+    ///     CmsgStr::empty(),
     ///     flags,
     /// ).unwrap().bytes();
     /// assert_eq!(message.len(), l);
     /// // Receive the message
     /// let mut buffer = vec![0u8; message.len()];
-    /// const CMSG_SPACE: usize = cmsg_space!(ScmTimestamp);
-    /// let mut cmsg = CmsgVecRead::with_capacity(CMSG_SPACE);
+    /// let mut cmsg = cmsg_vec![ScmTimestamp];
     /// let mut iov = [IoSliceMut::new(&mut buffer)];
     /// let mut header = RecvMsgHeader::new();
-    /// let r = recvmsg::<Option<SockaddrIn>, _>(
+    /// let r = recvmsg::<Ipv4Address>(
     ///     in_socket.as_raw_fd(),
     ///     &mut header,
     ///     &mut iov,
@@ -1710,17 +1747,16 @@ impl ControlMessageOwnedSpace {
 ///
 /// [here]: https://pubs.opengroup.org/onlinepubs/9699919799/functions/sendmsg.html
 /// [Further reading]: https://pubs.opengroup.org/onlinepubs/9699919799/functions/sendmsg.html
-pub fn sendmsg<'a, S, I, C>(
+pub fn sendmsg<'a, S, I>(
     fd: RawFd,
     addr: Option<&S>,
     iov: &I,
-    cmsgs: &C,
+    cmsgs: &CmsgStr,
     flags: MsgFlags,
 ) -> Result<SendMsgResult>
 where
     S: SockaddrLike,
     I: AsRef<[IoSlice<'a>]>,
-    C: CmsgBufWrite + ?Sized,
 {
     let header = sendmsg_header(addr, iov.as_ref(), cmsgs);
 
@@ -1771,7 +1807,7 @@ where
 /// setsockopt(&recv, Timestamping, &TimestampingFlag::all())?;
 ///
 /// // This is the address we are going to send the message.
-/// let addr = "127.0.0.1:6069".parse::<SockaddrIn>().unwrap();
+/// let addr = "127.0.0.1:6069".parse::<Ipv4Address>().unwrap();
 ///
 /// bind(recv.as_raw_fd(), &addr)?;
 ///
@@ -1787,7 +1823,7 @@ where
 ///     send.as_raw_fd(),
 ///     Some(&addr),
 ///     &[IoSlice::new(&msg)],
-///     CmsgEmpty::write(),
+///     CmsgStr::empty(),
 ///     MsgFlags::empty(),
 /// )?;
 ///
@@ -1801,7 +1837,7 @@ where
 /// let mut cmsg = cmsg_vec![ScmTimestampsns];
 ///
 /// // Initialize the container for the `recvmsg`-header.
-/// let mut header = RecvMsgHeader::<Option<SockaddrIn>>::new();
+/// let mut header = RecvMsgHeader::<Ipv4Address>::new();
 ///
 /// // Receive `msg` on `recv`.
 /// let recv_res = recvmsg(
@@ -1831,16 +1867,15 @@ where
 /// ```
 ///
 /// [Further reading]: https://pubs.opengroup.org/onlinepubs/9699919799/functions/recvmsg.html
-pub fn recvmsg<'a, S, C>(
+pub fn recvmsg<'a, S>(
     fd: RawFd,
     header: &'a mut RecvMsgHeader<S>,
     iov: &mut [IoSliceMut<'_>],
-    cmsg_buffer: &'a mut C,
+    cmsg_buffer: &'a mut [MaybeUninit<u8>],
     flags: MsgFlags,
 ) -> Result<RecvMsgResult<'a, S>>
 where
-    S: SockaddrFromRaw,
-    C: CmsgBufRead + ?Sized,
+    S: SockaddrFromRaw + ?Sized,
 {
     header.fill_recv(iov, cmsg_buffer);
 
@@ -1853,57 +1888,50 @@ where
     Ok(RecvMsgResult { bytes, hdr, _phantom: std::marker::PhantomData })
 }
 
-/// Buffer for sending control messages.
-///
-/// # Safety
-///
-/// [`Self::raw_parts`] must return a pointer and length `len`, such that
-/// if `len > 0`, the pointer must be valid for reads and point to a contiguous buffer with
-/// `len` bytes, which contains properly aligned control messages.
-///
-/// See the libc manual of [`cmsg`] for more information.
-///
-/// [`cmsg`]: https://www.man7.org/linux/man-pages/man3/cmsg.3.html
-pub unsafe trait CmsgBufWrite {
-    /// Returns a pointer and length to the buffer containing control messages.
-    ///
-    /// If the buffer is empty, the pointer can be dangling or null.
-    fn raw_parts(&self) -> (*const u8, usize);
+/// Primitive for encoded control messages that can be **sent**.
+#[derive(Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(not(doc), repr(transparent))]
+pub struct CmsgStr {
+    slice: [u8],
 }
 
-unsafe impl<'a, T> CmsgBufWrite for &'a T
-where
-    T: CmsgBufWrite,
-{
-    fn raw_parts(&self) -> (*const u8, usize) {
-        (*self).raw_parts()
+impl CmsgStr {
+    /// Creates an empty [`CmsgStr`] with zero length.
+    pub const fn empty() -> &'static Self {
+        unsafe { Self::from_bytes_unchecked(&[]) }
+    }
+
+    /// Creates a new [`CmsgStr`] from the given bytes.
+    ///
+    /// [`write_cmsg_into`] can be used to encode an iterator of [`ControlMessage`]s
+    /// into a buffer.
+    ///
+    /// # Safety
+    ///
+    /// The given bytes must contain valid encoded control messages.
+    pub const unsafe fn from_bytes_unchecked(bytes: &[u8]) -> &Self {
+        &*(bytes as *const [u8] as *const Self)
+    }
+
+    /// Returns a raw pointer to the buffer.
+    pub const fn as_ptr(&self) -> *const u8 {
+        self.slice.as_ptr()
+    }
+
+    /// Returns the length of the buffer.
+    pub const fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    /// Returns whether the buffer is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.slice.len() == 0
     }
 }
 
-/// Buffer for receiving control messages.
-///
-/// # Safety
-///
-/// [`Self::raw_parts_mut`] must return a pointer and capacity `cap`, such that
-/// if `cap > 0`, the pointer must be valid for writes
-/// and point to a contiguous buffer with at least `cap` bytes.
-///
-/// See the libc manual of [`cmsg`] for more information.
-///
-/// [`cmsg`]: https://www.man7.org/linux/man-pages/man3/cmsg.3.html
-pub unsafe trait CmsgBufRead {
-    /// Returns a pointer and capacity of the buffer for receiving control messages.
-    ///
-    /// If the buffer is empty, the pointer can be dangling or null.
-    fn raw_parts_mut(&mut self) -> (*mut u8, usize);
-}
-
-unsafe impl<'a, T> CmsgBufRead for &'a mut T
-where
-    T: CmsgBufRead,
-{
-    fn raw_parts_mut(&mut self) -> (*mut u8, usize) {
-        (*self).raw_parts_mut()
+impl Default for &CmsgStr {
+    fn default() -> Self {
+        CmsgStr::empty()
     }
 }
 
@@ -2001,21 +2029,22 @@ where
     cmsg.into_iter().map(|c| c.space()).sum()
 }
 
-/// Non-extendable heap-allocated container for sending control messages.
+/// Non-extendable heap-allocated container for holding control messages
+/// that can be **sent**.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CmsgVecWrite {
+pub struct CmsgVec {
     inner: Vec<u8>,
 }
 
-impl CmsgVecWrite {
-    /// Returns an empty [`CmsgVecWrite`].
+impl CmsgVec {
+    /// Returns an empty [`CmsgVec`].
     ///
     /// No allocations are performed. Use this if no control messages are needed.
     pub const fn empty() -> Self {
         Self { inner: Vec::new() }
     }
 
-    /// Returns an empty [`CmsgVecWrite`] with the given capacity.
+    /// Returns an empty [`CmsgVec`] with the given capacity.
     pub fn with_capacity(cap: usize) -> Self {
         Self { inner: Vec::with_capacity(cap) }
     }
@@ -2186,147 +2215,33 @@ impl CmsgVecWrite {
     pub fn shrink_to_fit(&mut self) {
         self.inner.shrink_to_fit();
     }
+}
 
-    /// Returns a pointer and length to the buffer containing control messages.
-    fn raw_parts(&self) -> (*const u8, usize) {
-        (self.inner.as_ptr(), self.inner.len())
+impl std::ops::Deref for CmsgVec {
+    type Target = CmsgStr;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `CmsgVecWrite` is a newtype wrapper around `Vec<u8>`.
+        // `self.inner[..]` is guaranteed to be a valid `CmsgStr`.
+        unsafe { CmsgStr::from_bytes_unchecked(&self.inner) }
     }
 }
 
-// SAFETY: `self.0` contains valid control messages until its length.
-unsafe impl CmsgBufWrite for CmsgVecWrite {
-    fn raw_parts(&self) -> (*const u8, usize) {
-        self.raw_parts()
-    }
-}
-
-/// Heap-allocated container for receiving control messages.
-#[derive(Debug, Default)]
-pub struct CmsgVecRead {
-    inner: Vec<MaybeUninit<u8>>,
-}
-
-impl CmsgVecRead {
-    /// Returns an empty [`CmsgVecRead`].
-    ///
-    /// No allocations are performed. Use this if no control messages are needed.
-    pub const fn empty() -> Self {
-        Self {
-            inner: Vec::new(),
-        }
-    }
-
-    /// Returns an empty [`CmsgVecRead`] with the given capacity.
-    ///
-    /// [`cmsg_space!`] can be used to calculate the exact number of bytes required
-    /// to hold the received control messages.
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            inner: Vec::with_capacity(cap),
-        }
-    }
-
-    /// Returns the capacity of the buffer.
-    ///
-    /// This is the number of bytes that can be written to the buffer.
-    pub fn capacity(&self) -> usize {
-        self.inner.capacity()
-    }
-
-    /// Reserves extra capacity for the buffer.
-    ///
-    /// The buffer will be able to hold at least `total` bytes.
-    /// If the current capacity is larger than `total`, nothing happens.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the new capacity exceeds `isize::MAX`.
-    pub fn reserve_total(&mut self, total: usize) {
-        self.inner.reserve(total);
-    }
-
-    /// Shrinks the capacity of the buffer to at least the given minimum capacity.
-    pub fn shrink_to(&mut self, min_capacity: usize) {
-        self.inner.shrink_to(min_capacity);
-    }
-
-    /// Returns a pointer and capacity of the allocation that can hold control messages.
-    fn raw_parts_mut(&mut self) -> (*mut u8, usize) {
-        (self.inner.as_mut_ptr().cast(), self.inner.capacity())
-    }
-}
-
-/// Creates a new [`CmsgVecRead`] with the same capacity as `self`.
-impl Clone for CmsgVecRead {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Vec::with_capacity(self.inner.capacity()),
-        }
-    }
-}
-
-// SAFETY: we delegate to a `Vec` with byte-sized elements,
-// so the pointer points to an allocation if the returned capacity is non-zero.
-unsafe impl CmsgBufRead for CmsgVecRead {
-    fn raw_parts_mut(&mut self) -> (*mut u8, usize) {
-        self.raw_parts_mut()
-    }
-}
-
-/// Empy control message buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CmsgEmpty;
-
-impl CmsgEmpty {
-    /// Returns a reference to an empty control message buffer that
-    /// implements [`CmsgBufWrite`].
-    ///
-    /// Useful for sending messages without control messages.
-    pub fn write() -> &'static Self {
-        // SAFETY: `CMSG_EMPTY` is zero-sized and doesn't
-        // serve as a singleton protecting any observable state
-        // of the program.
-        unsafe { ptr::NonNull::dangling().as_ref() }
-    }
-
-    /// Returns a mutable reference to an empty control message buffer that
-    /// implements [`CmsgBufRead`].
-    ///
-    /// Useful for receiving messages without control messages.
-    pub fn read() -> &'static mut Self {
-        // SAFETY: `CMSG_EMPTY` is zero-sized and doesn't
-        // serve as a singleton protecting any observable state
-        // of the program.
-        unsafe { ptr::NonNull::dangling().as_mut() }
-    }
-}
-
-// SAFETY: returning length 0 is always safe.
-unsafe impl CmsgBufWrite for CmsgEmpty {
-    fn raw_parts(&self) -> (*const u8, usize) {
-        (ptr::null(), 0)
-    }
-}
-
-// SAFETY: returning capacity 0 is always safe.
-unsafe impl CmsgBufRead for CmsgEmpty {
-    fn raw_parts_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::null_mut(), 0)
-    }
-}
-
-fn sendmsg_header<S, C>(
+fn sendmsg_header<S>(
     addr: Option<&S>,
     iov: &[IoSlice<'_>],
-    cmsg: &C,
+    cmsg: &CmsgStr,
 ) -> libc::msghdr
 where
     S: SockaddrLike,
-    C: CmsgBufWrite + ?Sized,
 {
     let (addr_ptr, addr_len) = addr.map_or((ptr::null(), 0), |a| (a.as_sockaddr(), a.len()));
     let (iov_ptr, iov_len) = (iov.as_ptr(), iov.len());
-    let (cmsg_ptr, cmsg_len) = cmsg.raw_parts();
+    let (cmsg_ptr, cmsg_len) = if cmsg.is_empty() {
+        (ptr::null(), 0)
+    } else {
+        (cmsg.as_ptr(), cmsg.len())
+    };
 
     let mut msg_hdr = MaybeUninit::<libc::msghdr>::zeroed();
     let msg_hdr_ptr = msg_hdr.as_mut_ptr();
@@ -2349,14 +2264,13 @@ where
     target_os = "freebsd",
     target_os = "netbsd",
 ))]
-fn sendmmsg_headers_into<'a, I, S, C>(
+fn sendmmsg_headers_into<'a, I, S>(
     buf: &mut [MaybeUninit<libc::mmsghdr>],
     items: I,
 ) -> usize
 where
-    I: Iterator<Item = (Option<&'a S>, &'a [IoSlice<'a>], &'a C)>,
+    I: Iterator<Item = (Option<&'a S>, &'a [IoSlice<'a>], &'a CmsgStr)>,
     S: SockaddrLike + 'a,
-    C: CmsgBufWrite + ?Sized + 'a,
 {
     let mut total = 0;
 
@@ -2374,17 +2288,20 @@ where
     total
 }
 
-fn recvmsg_header<S, C>(
+fn recvmsg_header<S>(
     addr: &mut MaybeUninit<S::Storage>,
     iov: &mut [IoSliceMut<'_>],
-    cmsg: &mut C,
+    cmsg: &mut [MaybeUninit<u8>],
 ) -> libc::msghdr
 where
-    S: SockaddrFromRaw,
-    C: CmsgBufRead + ?Sized,
+    S: SockaddrFromRaw + ?Sized,
 {
     let (iov_ptr, iov_len) = (iov.as_mut().as_mut_ptr(), iov.as_mut().len());
-    let (cmsg_ptr, cmsg_len) = cmsg.raw_parts_mut();
+    let (cmsg_ptr, cmsg_len) = if cmsg.is_empty() {
+        (ptr::null_mut(), 0)
+    } else {
+        (cmsg.as_mut_ptr(), cmsg.len())
+    };
 
     let mut msg_hdr = MaybeUninit::<libc::msghdr>::zeroed();
     let msg_hdr_ptr = msg_hdr.as_mut_ptr();
@@ -2409,16 +2326,15 @@ where
     target_os = "freebsd",
     target_os = "netbsd",
 ))]
-fn recvmmsg_headers_into<'a, 'b, S, I, C>(
+fn recvmmsg_headers_into<'a, 'b, S, I>(
     buf: &mut [MaybeUninit<libc::mmsghdr>],
     addrs: &mut [MaybeUninit<S::Storage>],
     items: I,
 ) -> usize
 where
     'b: 'a,
-    S: SockaddrFromRaw,
-    I: Iterator<Item = (&'a mut [IoSliceMut<'b>], &'a mut C)>,
-    C: CmsgBufRead + ?Sized + 'a,
+    S: SockaddrFromRaw + ?Sized,
+    I: Iterator<Item = (&'a mut [IoSliceMut<'b>], &'a mut [MaybeUninit<u8>])>,
 {
     debug_assert_eq!(addrs.len(), buf.len());
 
@@ -2426,7 +2342,7 @@ where
 
     for (i, (iov, cmsg)) in items.take(buf.len()).enumerate() {
         let mmsg_hdr = libc::mmsghdr {
-            msg_hdr: recvmsg_header::<S, _>(&mut addrs[i], iov, cmsg),
+            msg_hdr: recvmsg_header::<S>(&mut addrs[i], iov, cmsg),
             msg_len: 0,
         };
 
@@ -2477,11 +2393,10 @@ impl SendMmsgHeaders {
         }
     }
 
-    fn fill_send<'a, I, S, C>(&mut self, mut items: I)
+    fn fill_send<'a, I, S>(&mut self, mut items: I)
     where
-        I: Iterator<Item = (Option<&'a S>, &'a [IoSlice<'a>], &'a C)> + ExactSizeIterator,
+        I: Iterator<Item = (Option<&'a S>, &'a [IoSlice<'a>], &'a CmsgStr)> + ExactSizeIterator,
         S: SockaddrLike + 'a,
-        C: CmsgBufWrite + ?Sized + 'a,
     {
         let len = items.len();
 
@@ -2533,7 +2448,7 @@ unsafe impl Sync for SendMmsgHeaders {}
 #[derive(Debug, Default)]
 pub struct RecvMmsgHeaders<S>
 where
-    S: SockaddrFromRaw,
+    S: SockaddrFromRaw + ?Sized,
 {
     mmsghdrs: Vec<libc::mmsghdr>,
     addresses: Vec<MaybeUninit<S::Storage>>,
@@ -2547,7 +2462,7 @@ where
 ))]
 impl<S> RecvMmsgHeaders<S>
 where
-    S: SockaddrFromRaw,
+    S: SockaddrFromRaw + ?Sized,
 {
     /// Creates a new container for the `mmsg`-headers.
     ///
@@ -2568,11 +2483,10 @@ where
         }
     }
 
-    fn fill_recv<'a, 'b, I, C>(&mut self, mut items: I)
+    fn fill_recv<'a, 'b, I>(&mut self, mut items: I)
     where
         'b: 'a,
-        I: Iterator<Item = (&'a mut [IoSliceMut<'b>], &'a mut C)> + ExactSizeIterator,
-        C: CmsgBufRead + ?Sized + 'a,
+        I: Iterator<Item = (&'a mut [IoSliceMut<'b>], &'a mut [MaybeUninit<u8>])> + ExactSizeIterator,
     {
         let len = items.len();
 
@@ -2591,7 +2505,7 @@ where
             std::slice::from_raw_parts_mut(self.addresses.as_mut_ptr(), len)
         };
 
-        let size = recvmmsg_headers_into::<S, _, _>(mmsghdrs_uninit_slice, addresses_uninit_slice, items.by_ref());
+        let size = recvmmsg_headers_into::<S, _>(mmsghdrs_uninit_slice, addresses_uninit_slice, items.by_ref());
 
         if size != len || items.next().is_some() {
             panic!("Len returned by exact size iterator was not accurate");
@@ -2613,7 +2527,7 @@ where
 ))]
 unsafe impl<S> Send for RecvMmsgHeaders<S>
 where
-    S: SockaddrFromRaw + Send,
+    S: SockaddrFromRaw + Send + ?Sized,
 {}
 
 #[cfg(any(
@@ -2624,14 +2538,14 @@ where
 ))]
 unsafe impl<S> Sync for RecvMmsgHeaders<S>
 where
-    S: SockaddrFromRaw + Sync,
+    S: SockaddrFromRaw + Sync + ?Sized,
 {}
 
 /// Stack-allocated container holding a single header for [`recvmsg`].
 #[derive(Debug)]
 pub struct RecvMsgHeader<S>
 where
-    S: SockaddrFromRaw,
+    S: SockaddrFromRaw + ?Sized,
 {
     msg_hdr: MaybeUninit<libc::msghdr>,
     address: MaybeUninit<S::Storage>,
@@ -2639,7 +2553,7 @@ where
 
 impl<S> RecvMsgHeader<S>
 where
-    S: SockaddrFromRaw,
+    S: SockaddrFromRaw + ?Sized,
 {
     /// Creates a new container for a single message header.
     pub const fn new() -> Self {
@@ -2649,11 +2563,8 @@ where
         }
     }
 
-    fn fill_recv<C>(&mut self, iov: &mut [IoSliceMut<'_>], cmsg: &mut C)
-    where
-        C: CmsgBufRead + ?Sized,
-    {
-        let msg_hdr = recvmsg_header::<S, _>(&mut self.address, iov, cmsg);
+    fn fill_recv(&mut self, iov: &mut [IoSliceMut<'_>], cmsg: &mut [MaybeUninit<u8>]) {
+        let msg_hdr = recvmsg_header::<S>(&mut self.address, iov, cmsg);
 
         self.msg_hdr.write(msg_hdr);
     }
@@ -2661,7 +2572,7 @@ where
 
 impl<S> Default for RecvMsgHeader<S>
 where
-    S: SockaddrFromRaw,
+    S: SockaddrFromRaw + ?Sized,
 {
     fn default() -> Self {
         Self::new()
@@ -2670,12 +2581,12 @@ where
 
 unsafe impl<S> Send for RecvMsgHeader<S>
 where
-    S: SockaddrFromRaw + Send,
+    S: SockaddrFromRaw + Send + ?Sized,
 {}
 
 unsafe impl<S> Sync for RecvMsgHeader<S>
 where
-    S: SockaddrFromRaw + Sync,
+    S: SockaddrFromRaw + Sync + ?Sized,
 {}
 
 /// An extension of [`sendmsg`] that allows the caller to transmit multiple messages on a socket
@@ -2710,18 +2621,17 @@ where
     target_os = "freebsd",
     target_os = "netbsd",
 ))]
-pub fn sendmmsg<'h, 'a, J, S, I, C>(
+pub fn sendmmsg<'h, 'a, J, S, I>(
     fd: RawFd,
     headers: &'h mut SendMmsgHeaders,
     items: J,
     flags: MsgFlags,
 ) -> crate::Result<SendMmsgResult<'h>>
 where
-    J: IntoIterator<Item = (Option<&'a S>, &'a I, &'a C)>,
+    J: IntoIterator<Item = (Option<&'a S>, &'a I, &'a CmsgStr)>,
     J::IntoIter: ExactSizeIterator,
     S: SockaddrLike + 'a,
     I: AsRef<[IoSlice<'a>]> + ?Sized + 'a,
-    C: CmsgBufWrite + ?Sized + 'a,
 {
     headers.fill_send(items.into_iter().map(|(addr, iov, cmsg)| (addr, iov.as_ref(), cmsg)));
 
@@ -2797,7 +2707,7 @@ where
 /// )?;
 ///
 /// // This is the address we are going to send the message.
-/// let addr = "127.0.0.1:6069".parse::<SockaddrIn>().unwrap();
+/// let addr = "127.0.0.1:6069".parse::<Ipv4Address>().unwrap();
 ///
 /// bind(recv.as_raw_fd(), &addr)?;
 ///
@@ -2816,8 +2726,8 @@ where
 /// // On connectionless sockets like UDP, destination addresses are required.
 /// // Each message can be sent to a different address.
 /// let send_items = [
-///     (Some(&addr), &send_iov_1, CmsgEmpty::write()),
-///     (Some(&addr), &send_iov_2, CmsgEmpty::write()),
+///     (Some(&addr), &send_iov_1, CmsgStr::empty()),
+///     (Some(&addr), &send_iov_2, CmsgStr::empty()),
 /// ];
 ///
 /// // Send the messages on the send socket.
@@ -2842,12 +2752,12 @@ where
 /// let mut recv_iov_2 = [IoSliceMut::new(&mut buf_2)];
 ///
 /// // We preallocate headers for 2 messages.
-/// let mut recv_headers = RecvMmsgHeaders::<Option<SockaddrIn>>::new();
+/// let mut recv_headers = RecvMmsgHeaders::<Ipv4Address>::new();
 ///
 /// // Zip everything together.
 /// let mut recv_items = [
-///     (&mut recv_iov_1, CmsgEmpty::read()),
-///     (&mut recv_iov_2, CmsgEmpty::read()),
+///     (&mut recv_iov_1, Default::default()),
+///     (&mut recv_iov_2, Default::default()),
 /// ];
 ///
 /// // Receive `msg` on `recv`.
@@ -2880,7 +2790,7 @@ where
     target_os = "freebsd",
     target_os = "netbsd",
 ))]
-pub fn recvmmsg<'h, 'a, 'b, S, J, I, C>(
+pub fn recvmmsg<'h, 'a, 'b, S, J, I>(
     fd: RawFd,
     headers: &'h mut RecvMmsgHeaders<S>,
     items: J,
@@ -2888,11 +2798,10 @@ pub fn recvmmsg<'h, 'a, 'b, S, J, I, C>(
     mut timeout: Option<crate::sys::time::TimeSpec>,
 ) -> crate::Result<RecvMmsgResult<'h, S>>
 where
-    S: SockaddrFromRaw,
-    J: IntoIterator<Item = (&'a mut I, &'h mut C)>,
+    S: SockaddrFromRaw + ?Sized,
+    J: IntoIterator<Item = (&'a mut I, &'h mut [MaybeUninit<u8>])>,
     J::IntoIter: ExactSizeIterator,
     I: AsMut<[IoSliceMut<'b>]> + ?Sized + 'a,
-    C: CmsgBufRead + ?Sized + 'h,
 {
     headers.fill_recv(items.into_iter().map(|(iov, cmsg)| (iov.as_mut(), cmsg)));
 
@@ -3038,7 +2947,7 @@ unsafe impl<'a> Sync for SendMmsgResult<'a> {}
     target_os = "netbsd",
 ))]
 #[derive(Debug, Clone)]
-pub struct RecvMmsgResult<'a, S> {
+pub struct RecvMmsgResult<'a, S: ?Sized> {
     headers: std::slice::Iter<'a, libc::mmsghdr>,
     _s: std::marker::PhantomData<fn() -> S>,
 }
@@ -3170,7 +3079,7 @@ unsafe impl Sync for SendMsgResult {}
 
 /// Result for receiving messages.
 #[derive(Debug, Clone, Copy)]
-pub struct RecvMsgResult<'a, S> {
+pub struct RecvMsgResult<'a, S: ?Sized> {
     bytes: usize,
     hdr: libc::msghdr,
     // For covariance without drop check, should we ever need a `Drop` impl.
@@ -3181,7 +3090,7 @@ pub struct RecvMsgResult<'a, S> {
 
 impl<'a, S> RecvMsgResult<'a, S>
 where
-    S: SockaddrFromRaw,
+    S: SockaddrFromRaw + ?Sized,
 {
     /// Returns the number of bytes received.
     pub fn bytes(&self) -> usize {
@@ -3195,11 +3104,11 @@ where
     /// - connection-oriented (e.g. TCP), `None` is returned.
     ///
     /// - connectionless (e.g. UDP), `Some` is returned.
-    pub fn address(&self) -> S::Out<'_> {
+    pub fn address(&self) -> S::Out {
         // SAFETY: `self.0` either contains a valid address, or a provable invalid address
         // as initialized by `S:init_storage`.
         unsafe {
-            S::from_raw(self.hdr.msg_name.cast_const().cast(), self.hdr.msg_namelen)
+            S::from_raw(self.hdr.msg_name.cast_const().cast(), self.hdr.msg_namelen as usize)
         }
     }
 
@@ -3275,11 +3184,11 @@ mod test {
     fn test_recvmm_2() -> crate::Result<()> {
         use crate::sys::socket::{
             AddressFamily,sendmsg, setsockopt, socket, sockopt::Timestamping, MsgFlags, SockFlag, SockType,
-            SockaddrIn, TimestampingFlag, CmsgEmpty,
+            Ipv4Address, TimestampingFlag,
         };
         use std::io::{IoSlice, IoSliceMut};
 
-        let sock_addr = SockaddrIn::from_str("127.0.0.1:6791").unwrap();
+        let sock_addr = Ipv4Address::from_str("127.0.0.1:6791").unwrap();
 
         let ssock = socket(
             AddressFamily::INET,
@@ -3318,20 +3227,19 @@ mod test {
         let flags = MsgFlags::empty();
         let iov1 = [IoSlice::new(&sbuf)];
 
-        const CMSG_SPACE: usize = cmsg_space!(ScmTimestampsns);
-        sendmsg(ssock.as_raw_fd(), Some(&sock_addr), &iov1, CmsgEmpty::write(), flags).unwrap();
+        sendmsg(ssock.as_raw_fd(), Some(&sock_addr), &iov1, Default::default(), flags).unwrap();
 
         let mut headers = super::RecvMmsgHeaders::<()>::with_capacity(recv_iovs.len());
 
         let mut cmsgs = Vec::with_capacity(recv_iovs.len());
 
         for _ in 0..recv_iovs.len() {
-            cmsgs.push(super::CmsgVecRead::with_capacity(CMSG_SPACE));
+            cmsgs.push(cmsg_vec_internal![ScmTimestampsns]);
         }
 
         let t = sys::time::TimeSpec::from_duration(std::time::Duration::from_secs(10));
 
-        let items = recv_iovs.iter_mut().zip(cmsgs.iter_mut());
+        let items = recv_iovs.iter_mut().zip(cmsgs.iter_mut().map(|vec| &mut vec[..]));
 
         let recv = super::recvmmsg(rsock.as_raw_fd(), &mut headers, items, flags, Some(t))?;
 
@@ -3371,8 +3279,7 @@ mod test {
     fn cmsg_empty_sanity() {
         use super::*;
 
-        assert_eq!(CmsgEmpty::write().raw_parts().1, 0);
-        assert_eq!(CmsgEmpty::read().raw_parts_mut().1, 0);
+        assert_eq!(CmsgStr::empty().len(), 0);
     }
 }
 }
@@ -3463,7 +3370,7 @@ pub fn bind<S>(fd: RawFd, addr: &S) -> Result<()>
 where
     S: SockaddrLike,
 {
-    let res = unsafe { libc::bind(fd, addr.as_sockaddr(), addr.len()) };
+    let res = unsafe { libc::bind(fd, addr.as_sockaddr(), addr.len() as _) };
 
     Errno::result(res).map(drop)
 }
@@ -3510,7 +3417,7 @@ pub fn accept4(sockfd: RawFd, flags: SockFlag) -> Result<RawFd> {
 ///
 /// [Further reading](https://pubs.opengroup.org/onlinepubs/9699919799/functions/connect.html)
 pub fn connect(fd: RawFd, addr: &dyn SockaddrLike) -> Result<()> {
-    let res = unsafe { libc::connect(fd, addr.as_sockaddr(), addr.len()) };
+    let res = unsafe { libc::connect(fd, addr.as_sockaddr(), addr.len() as _) };
 
     Errno::result(res).map(drop)
 }
@@ -3537,10 +3444,10 @@ pub fn recv(sockfd: RawFd, buf: &mut [u8], flags: MsgFlags) -> Result<usize> {
 /// address of the sender.
 ///
 /// [Further reading](https://pubs.opengroup.org/onlinepubs/9699919799/functions/recvfrom.html)
-pub fn recvfrom<'a, T: SockaddrFromRaw>(
+pub fn recvfrom<T: SockaddrFromRaw + ?Sized>(
     sockfd: RawFd,
     buf: &mut [u8],
-) -> Result<(usize, T::Out<'static>)> {
+) -> Result<(usize, T::Out)> {
     unsafe {
         let mut addr = mem::MaybeUninit::<T::Storage>::uninit();
         let mut len = mem::size_of_val(&addr) as socklen_t;
@@ -3554,7 +3461,7 @@ pub fn recvfrom<'a, T: SockaddrFromRaw>(
             &mut len as *mut socklen_t,
         ))? as usize;
 
-        Ok((ret, T::from_raw(addr.as_ptr(), len)))
+        Ok((ret, T::from_raw(addr.as_ptr(), len as usize)))
     }
 }
 
@@ -3574,7 +3481,7 @@ pub fn sendto(
             buf.len() as size_t,
             flags.bits(),
             addr.as_sockaddr(),
-            addr.len(),
+            addr.len() as _,
         )
     };
 
@@ -3653,7 +3560,7 @@ pub fn setsockopt<F: AsFd, O: SetSockOpt>(
 /// Get the address of the peer connected to the socket `fd`.
 ///
 /// [Further reading](https://pubs.opengroup.org/onlinepubs/9699919799/functions/getpeername.html)
-pub fn getpeername<T: SockaddrFromRaw>(fd: RawFd) -> Result<T::Owned> {
+pub fn getpeername<T: SockaddrFromRaw + ?Sized>(fd: RawFd) -> Result<T::Out> {
     unsafe {
         let mut addr = MaybeUninit::<T::Storage>::uninit();
         let mut len = mem::size_of::<T::Storage>() as _;
@@ -3665,14 +3572,14 @@ pub fn getpeername<T: SockaddrFromRaw>(fd: RawFd) -> Result<T::Owned> {
 
         Errno::result(ret)?;
 
-        Ok(T::from_raw(addr.as_ptr(), len).to_owned_addr())
+        Ok(T::from_raw(addr.as_ptr(), len as usize))
     }
 }
 
 /// Get the current address to which the socket `fd` is bound.
 ///
 /// [Further reading](https://pubs.opengroup.org/onlinepubs/9699919799/functions/getsockname.html)
-pub fn getsockname<T: SockaddrFromRaw>(fd: RawFd) -> Result<T::Owned> {
+pub fn getsockname<T: SockaddrFromRaw + ?Sized>(fd: RawFd) -> Result<T::Out> {
     unsafe {
         let mut addr = MaybeUninit::<T::Storage>::uninit();
 
@@ -3685,7 +3592,7 @@ pub fn getsockname<T: SockaddrFromRaw>(fd: RawFd) -> Result<T::Owned> {
 
         Errno::result(ret)?;
 
-        Ok(T::from_raw(addr.as_ptr(), len).to_owned_addr())
+        Ok(T::from_raw(addr.as_ptr(), len as usize))
     }
 }
 
