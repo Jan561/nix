@@ -5,21 +5,21 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches:
-      - master
+      - "*"
   merge_group:
     types: [checks_requested]
 
 permissions:
-  contents: read 
+  contents: read
 
-env: 
+env:
   MSRV: 1.69.0
 
 jobs:
 
   macos:
     runs-on: macos-13
-    env: 
+    env:
       TARGET: x86_64-apple-darwin
     steps:
       - name: checkout
@@ -27,7 +27,7 @@ jobs:
 
       - name: setup Rust
         uses: dtolnay/rust-toolchain@master
-        with: 
+        with:
           toolchain: '${{ env.MSRV }}'
           components: clippy
 
@@ -48,7 +48,7 @@ jobs:
   # Use cross for QEMU-based testing
   # cross needs to execute Docker, GitHub Action already has it installed
   cross:
-    runs-on: ubuntu-20.04 
+    runs-on: ubuntu-20.04
     needs: [rustfmt, minver, macos, linux_native_builds, rust_stable]
     strategy:
       fail-fast: false
@@ -71,7 +71,7 @@ jobs:
 
       - name: setup Rust
         uses: dtolnay/rust-toolchain@master
-        with: 
+        with:
           toolchain: '${{ env.MSRV }}'
           components: clippy
 
@@ -118,7 +118,7 @@ jobs:
 
       - name: setup Rust
         uses: dtolnay/rust-toolchain@master
-        with: 
+        with:
           toolchain: '${{ env.MSRV }}'
           components: clippy
 
@@ -140,7 +140,7 @@ jobs:
 
   rust_stable:
     runs-on: ubuntu-20.04
-    env: 
+    env:
       TARGET: x86_64-unknown-linux-gnu
     steps:
       - name: checkout
@@ -148,7 +148,7 @@ jobs:
 
       - name: setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with: 
+        with:
           components: clippy
 
       - name: build
@@ -188,7 +188,7 @@ jobs:
           - target: x86_64-unknown-illumos
           # Cross claims to support running tests on iOS, but it actually doesn't.
           # https://github.com/rust-embedded/cross/issues/535
-          - target: aarch64-apple-ios 
+          - target: aarch64-apple-ios
           # cargo hack tries to invoke the iphonesimulator SDK for iOS
             NOHACK: true
           # Cross claims to support Linux powerpc64, but it really doesn't.
@@ -204,7 +204,7 @@ jobs:
 
       - name: setup Rust
         uses: dtolnay/rust-toolchain@master
-        with: 
+        with:
           toolchain: '${{ env.MSRV }}'
           components: clippy
 
@@ -220,12 +220,12 @@ jobs:
 
       - name: before_cache_script
         run: rm -rf $CARGO_HOME/registry/index
-  
+
 
   redox:
     runs-on: ubuntu-20.04
     needs: [rustfmt, minver, macos, linux_native_builds, rust_stable]
-    env: 
+    env:
       TARGET: x86_64-unknown-redox
       CLIPPYFLAGS: -D warnings
       BUILD: check
@@ -236,9 +236,9 @@ jobs:
       - name: setup Rust
         # Redox's MSRV policy is unclear.  Until they define it, use nightly.
         uses: dtolnay/rust-toolchain@nightly
-        with: 
+        with:
           components: clippy
-       
+
       - name: install targets
         run: rustup target add ${{ env.TARGET }}
 
@@ -251,13 +251,13 @@ jobs:
 
       - name: before_cache_script
         run: rm -rf $CARGO_HOME/registry/index
-  
+
 
 
   # Rust Tier 3 targets can't use Rustup
   tier3:
     runs-on: ubuntu-20.04
-    env: 
+    env:
       BUILD: check
       ZFLAGS: -Zbuild-std
       CLIPPYFLAGS: -D warnings
@@ -277,7 +277,7 @@ jobs:
 
       - name: setup Rust
         uses: dtolnay/rust-toolchain@nightly
-        with: 
+        with:
           components: clippy
 
       - name: install src
@@ -300,7 +300,7 @@ jobs:
   # rand, can't build with their own minimal dependencies.
   minver:
     runs-on: ubuntu-20.04
-    env: 
+    env:
       TARGET: x86_64-unknown-linux-gnu
     steps:
       - name: checkout
@@ -309,7 +309,7 @@ jobs:
       - name: setup Rust
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: setup 
+      - name: setup
         run: cargo update -Zminimal-versions
 
       - name: check
